@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[Unit]
+Description=Zorian server (tiny packages caching proxy)
+Requires=network-online.target
+Wants=time-sync.target
+After=time-sync.target network-online.target remote-fs.target nss-lookup.target
+
+[Service]
+Type=exec
+User=zorian
+Group=zorian
+ExecPaths=/usr/local/bin/zorian /usr/lib
+ExecStart=/usr/local/bin/zorian --config=/etc/zorian.toml --pid-file=%t/%p/%p.pid
+LimitCORE=infinity
+LimitNOFILE=500000
+Restart=always
+RestartSec=30
+# %p is resolved to the systemd unit name
+RuntimeDirectory=%p 
+
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoExecPaths=/
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+UMask=0077
+
+[Install]
+# service should not start from the rescue shell (rescue.target).
+WantedBy=multi-user.target

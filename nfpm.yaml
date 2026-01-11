@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# yaml-language-server: $schema=https://nfpm.goreleaser.com/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+name: zorian
+arch: ${ARCH}
+version: ${VERSION}
+license: AGPL-3.0-or-later
+platform: linux
+maintainer: Nikolay Govorov <me@govorov.online>
+description: Tiny packages caching proxy
+
+contents:
+  - src: ./LICENSE
+    dst: /usr/share/doc/zorian/LICENSE
+  - src: ./README.md
+    dst: /usr/share/doc/zorian/README.md
+
+  - src: target/release/zorian
+    dst: /usr/local/bin/zorian
+    file_info:
+      mode: 0755
+
+  - src: pkg/zorian.toml
+    dst: /etc/zorian.toml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+      owner: zorian
+
+  - src: pkg/zorian.service
+    dst: /usr/lib/systemd/system/zorian.service
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: pkg/scripts/postinstall.sh
+  preremove: pkg/scripts/preremove.sh
+
+rpm:
+  group: System Environment/Daemons
