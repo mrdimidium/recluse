@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 name: Build
 
 on:
@@ -60,8 +63,9 @@ jobs:
 
       - name: Build packages
         run: |
+          PKG_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          export VERSION="${PKG_VERSION}-dev.$(date +%s)+$(git rev-parse --short HEAD)"
           export ARCH=${{ matrix.arch }}
-          export VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
 
           mkdir -p dist/
           for pkg in deb rpm archlinux; do
@@ -74,7 +78,7 @@ jobs:
           path: dist/*
 
   release:
-    name: Update nightly tag
+    name: Update dev tag
     runs-on: ubuntu-latest
     needs: [build]
     if: github.ref == 'refs/heads/main'
@@ -83,13 +87,13 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - name: Update 'nightly' tag
+      - name: Update 'dev' tag
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git tag -f nightly
-          git push origin --force tag nightly
+          git tag -f dev
+          git push origin --force tag dev
 
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -100,10 +104,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
-          name: nightly
-          tag_name: nightly
+          name: dev
+          tag_name: dev
           files: dist/*
           body: |
+            Last successful build from `main` branch.
+
             **Release checks**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
