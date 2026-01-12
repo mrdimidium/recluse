@@ -1,5 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-addr="0.0.0.0:3000"
+# Zorian will dutifully indicate its user agent and protocols (for example, source for zig).
+# Specify your name if you want your instance to be identified.
+appname="zorian"
+
+# The address to which the server will respond via HTTP.
+# Use a reverse proxy if you want to add TLS.
+listen="0.0.0.0:3000"
+
+# Path to the directory for storing state (indexes, caches, statistics).
+# Must be a writable directory.
 dirname="/var/lib/zorian"

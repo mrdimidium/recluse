@@ -2,36 +2,174 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use axum::{Router, body, extract, http, response, routing};
-use std::sync::{Arc, OnceLock};
+use semver::Version;
+use std::sync::Arc;
+use thiserror::Error;
 
+use crate::service_config;
 use crate::service_storage;
 use crate::service_upstream;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Archive {
+    Zip,
+    TarXz,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TarballType<'a> {
+    Source,
+    Bootstrap,
+    Binary { os: &'a str, arch: &'a str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid tarball filename")]
+struct ParseError;
+
+/// Describes a single file stored at `ziglang.org/download/`.
+///
+/// The tarball naming has changed several times. When parsing,
+/// we standardize the files, but for the reverse operation
+/// (getting a string from a tarball), we preserve the original path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tarball<'a> {
+    filename: &'a str,
+    tarball_type: TarballType<'a>,
+    minisig: bool,
+    archive: Archive,
+    version: Version,
+    development: bool,
+}
+
+impl<'a> Tarball<'a> {
+    pub fn parse(filename: &'a str) -> Result<Self, ParseError> {
+        let mut buffer = filename;
+        let mut minisig = false;
+        let archive;
+        let tarball_type;
+
+        // (?:|-bootstrap|-[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(\d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?)\.(?:tar\.xz|zip)(?:\.minisig)?
+        buffer = buffer.strip_prefix("zig-").ok_or(ParseError)?;
+
+        // (?:|bootstrap|[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(\d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?)\.(?:tar\.xz|zip)
+        if let Some(it) = buffer.strip_suffix(".minisig") {
+            buffer = it;
+            minisig = true;
+        }
+
+        // (?:|bootstrap|[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(\d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?)
+        if let Some(it) = buffer.strip_suffix(".zip") {
+            buffer = it;
+            archive = Archive::Zip;
+        } else if let Some(it) = buffer.strip_suffix(".tar.xz") {
+            buffer = it;
+            archive = Archive::TarXz;
+        } else {
+            return Err(ParseError);
+        }
+
+        if buffer.is_empty() {
+            return Err(ParseError);
+        }
+
+        let mut it = buffer.rsplit('-');
+        let last = it.next().ok_or(ParseError)?;
+
+        let development = last.starts_with("dev");
+
+        let version = if !development {
+            Version::parse(last).map_err(|_| ParseError)?
+        } else {
+            let semver = it.next().ok_or(ParseError)?;
+            let devver = last;
+            let version_str = format!("{}-{}", semver, devver);
+            Version::parse(&version_str).map_err(|_| ParseError)?
+        };
+
+        if let Some(payload) = it.next() {
+            if payload == "bootstrap" {
+                tarball_type = TarballType::Bootstrap;
+            } else {
+                // Version 0.14.0 is the last one to use the OS-ARCH format in names; newer versions use ARCH-OS.
+                let min_version = Version::new(0, 14, 0);
+                if version > min_version {
+                    tarball_type = TarballType::Binary {
+                        os: payload,
+                        arch: it.next().ok_or(ParseError)?,
+                    };
+                } else {
+                    tarball_type = TarballType::Binary {
+                        arch: payload,
+                        os: it.next().ok_or(ParseError)?,
+                    };
+                }
+            }
+        } else {
+            tarball_type = TarballType::Source;
+        }
+
+        if it.next().is_some() {
+            return Err(ParseError);
+        }
+
+        Ok(Tarball {
+            filename,
+            tarball_type,
+            minisig,
+            archive,
+            version,
+            development,
+        })
+    }
+
+    /// Builds the upstream URL for this tarball.
+    pub fn upstream_url(&self, source: &str) -> String {
+        if self.development {
+            format!(
+                "https://ziglang.org/builds/{}?source={}",
+                self.filename, source
+            )
+        } else {
+            format!(
+                "https://ziglang.org/download/{}/{}?source={}",
+                self.version, self.filename, source,
+            )
+        }
+    }
+}
+
 pub struct ZigController {
+    config: Arc<service_config::ConfigService>,
     storage: Arc<service_storage::StorageService>,
     upstream: Arc<service_upstream::UpstreamService>,
 }
 
 impl ZigController {
     pub fn new(
+        config: Arc<service_config::ConfigService>,
         storage: Arc<service_storage::StorageService>,
         upstream: Arc<service_upstream::UpstreamService>,
     ) -> Self {
-        Self { storage, upstream }
+        Self {
+            config,
+            storage,
+            upstream,
+        }
     }
 
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
-            .route("/zig/{filename}", routing::get(Self::download))
+            .route("/zig/{filename}", routing::get(Self::handle))
             .with_state(self)
     }
 
-    async fn download(
+    async fn handle(
         extract::State(controller): extract::State<Arc<Self>>,
         extract::Path(filename): extract::Path<String>,
     ) -> Result<response::Response, http::StatusCode> {
-        let version = Self::parse_version(&filename).ok_or(http::StatusCode::NOT_FOUND)?;
-        let url = Self::build_upstream_url(&filename, &version);
+        let tarball = Tarball::parse(&filename).map_err(|_| http::StatusCode::NOT_FOUND)?;
+        let url = tarball.upstream_url(controller.config.appname());
 
         match controller.storage.get(&filename).await {
             Ok(Some(entry)) => {
@@ -59,31 +197,6 @@ impl ZigController {
         }
 
         Ok(Self::build_response(http::StatusCode::OK, cache_entry))
-    }
-
-    fn parse_version(filename: &str) -> Option<String> {
-        let re = Self::filename_regex();
-        re.captures(filename)
-            .and_then(|captures| captures.get(1))
-            .map(|match_| match_.as_str().to_string())
-    }
-
-    fn filename_regex() -> &'static regex::Regex {
-        static REGEX: OnceLock<regex::Regex> = OnceLock::new();
-        REGEX.get_or_init(|| {
-            regex::Regex::new(
-                r"^zig(?:|-bootstrap|-[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(\d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?)\.(?:tar\.xz|zip)(?:\.minisig)?$",
-            )
-            .unwrap()
-        })
-    }
-
-    fn build_upstream_url(filename: &str, version: &str) -> String {
-        if version.contains("-dev.") {
-            format!("https://ziglang.org/builds/{filename}")
-        } else {
-            format!("https://ziglang.org/download/{version}/{filename}")
-        }
     }
 
     fn build_response(

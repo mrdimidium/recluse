@@ -17,8 +17,12 @@ ExecPaths=/usr/local/bin/zorian /usr/lib
 ExecStart=/usr/local/bin/zorian --config=/etc/zorian.toml
 LimitCORE=infinity
 LimitNOFILE=500000
+
 # %p is resolved to the systemd unit name
-RuntimeDirectory=%p 
+LogsDirectory=%p
+StateDirectory=%p
+CacheDirectory=%p
+RuntimeDirectory=%p
 
 LockPersonality=yes
 NoNewPrivileges=yes
