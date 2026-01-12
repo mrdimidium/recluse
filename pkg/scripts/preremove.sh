@@ -4,5 +4,7 @@
 
 set -e
 
-systemctl stop zorian.service || true
-systemctl disable zorian.service || true
+if [ -x "/bin/systemctl" ] && [ -d /run/systemd/system ] && [ -f /usr/lib/systemd/system/zorian.service ]; then
+  /bin/systemctl stop zorian.service || true
+  /bin/systemctl disable zorian.service || true
+fi
