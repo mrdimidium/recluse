@@ -92,8 +92,8 @@ jobs:
           name: packages-${{ matrix.arch }}
           path: dist/*
 
-  release:
-    name: Update dev tag
+  publish:
+    name: Publish dev build
     runs-on: ubuntu-latest
     needs: [build]
     if: github.ref == 'refs/heads/main'
@@ -101,14 +101,10 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-
-      - name: Update 'dev' tag
+      - name: Install tools
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git tag -f ${{ env.RELEASE_TAG }}
-          git push origin --force tag ${{ env.RELEASE_TAG }}
+          sudo apt-get update
+          sudo apt-get install -y aptly rclone createrepo-c
 
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -116,11 +112,25 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Configure GPG keys
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec #v6.3.0
+        with:
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
       - name: Export GPG public key
         run: printf '%s' "$GPG_PUBLIC_KEY" > dist/public.gpg
         env:
           GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
 
+      # Update Github Release
+      - name: Update 'dev' tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -f ${{ env.RELEASE_TAG }}
+          git push origin --force tag ${{ env.RELEASE_TAG }}
       - name: Delete old release assets
         run: |
           for asset in $(gh release view ${{ env.RELEASE_TAG }} --json assets --jq '.assets[].name' 2>/dev/null || true); do
@@ -128,7 +138,6 @@ jobs:
           done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
@@ -141,3 +150,31 @@ jobs:
             **Release checks**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Update APT/RPM repos on s3
+      - name: Create APT repository
+        run: |
+          aptly repo create -distribution=dev -component=main zorian
+          aptly repo add zorian dist/*.deb
+          aptly publish repo -architectures=amd64,arm64 -gpg-key="${{vars.GPG_KEY_ID}}" zorian
+      - name: Create RPM repository
+        run: |
+          mkdir -p rpm-repo
+          cp dist/*.rpm rpm-repo/
+          createrepo_c rpm-repo/
+          gpg --default-key="${{vars.GPG_KEY_ID}}" --detach-sign --armor rpm-repo/repodata/repomd.xml
+      - name: Upload RPM to S3
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [hetzner]
+          type = s3
+          provider = Other
+          acl = public-read
+          endpoint = ${{vars.S3_ENDPOINT}}
+          access_key_id = ${{secrets.S3_ACCESS_KEY_ID}}
+          secret_access_key = ${{secrets.S3_SECRET_ACCESS_KEY}}
+          EOF
+
+          rclone sync rpm-repo/        "hetzner:${{vars.S3_BUCKET}}/rpm/" --progress
+          rclone sync ~/.aptly/public/ "hetzner:${{vars.S3_BUCKET}}/apt/" --progress

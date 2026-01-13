@@ -1,48 +1,45 @@
 # Zorian — tiny packages caching proxy
 
-Soon humanity will go to Mars and in order for the colonists to be able to program, we will need a local mirror of packages.
+Soon humanity will go to Mars and in order for the colonists to be able
+to program, we will need a local mirror of packages.
 
 ## Installation
 
-Please note that the project is in its infancy and is **not** intended for production use.
+Please note that the project is in its infancy and
+is **not** intended for production use.
 
-**Use pre-bundled dev build:**
+**Debian/Ubuntu:**
 
-1. Install dependencies:
-    - Fedora/RedHat: `sudo dnf install yum-utils`
-    - Debian/Ubuntu: `sudo apt install apt-transport-https ca-certificates curl gnupg`
-1. Download the package for your distribution from the [releases page](https://github.com/mrdimidium/Zorian/releases/tag/dev)
-1. Install via system package manager:
+```bash
+sudo apt install curl gnupg
 
-    ```bash
-    # Debian/Ubuntu
-    curl -fsSL https://github.com/mrdimidium/Zorian/releases/download/dev/public.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zorian.gpg
-    sudo dpkg -i zorian_*.deb     
+curl -fsSL https://github.com/mrdimidium/Zorian/releases/download/dev/public.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zorian.gpg
+echo "deb [signed-by=/usr/share/keyrings/zorian.gpg] https://zorian.hel1.your-objectstorage.com/apt/ dev main" | sudo tee /etc/apt/sources.list.d/zorian.list
+sudo apt update && sudo apt install zorian
 
-    # Fedora/RedHat
-    sudo rpm --import https://github.com/mrdimidium/Zorian/releases/download/dev/public.gpg
-    sudo dnf install zorian-*.rpm 
-    ```
+sudo systemctl enable --now zorian
+```
 
-1. Start systemd service: `sudo systemctl enable --now zorian`
+**Fedora/RedHat:**
 
-**Build from source:**
+```bash
+sudo rpm --import https://github.com/mrdimidium/Zorian/releases/download/dev/public.gpg
+sudo dnf config-manager --add-repo https://zorian.hel1.your-objectstorage.com/rpm/
+sudo dnf install zorian
+
+sudo systemctl enable --now zorian
+```
+
+## Build from source
 
 1. Install build dependencies:
     - Fedora/RedHat: `sudo dnf install gcc openssl-devel pkg-config`
     - Debian/Ubuntu: `sudo apt install build-essential libssl-dev pkg-config`
-1. Clone and build via cargo:
+1. Clone repo: `git clone https://github.com/mrdimidium/Zorian.git && cd Zorian`
+1. Build from source: `cargo build --release`
+1. Install manually
 
     ```bash
-    git clone https://github.com/mrdimidium/Zorian.git && cd Zorian
-
-    cargo build --release
-
-    # Build linux package packages via nfpm (ihttps://nfpm.goreleaser.com/)
-    nfpm package -p deb --target dist/
-    nfpm package -p rpm --target dist/
-
-    # Install binary manually
     sudo groupadd --system zorian
     sudo useradd --system --gid zorian --no-create-home --shell /usr/sbin/nologin zorian
     sudo install -m 700 -o zorian ./pkg/zorian.toml     /etc/
