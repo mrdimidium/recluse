@@ -38,7 +38,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
-use super::service_config::ConfigService;
+use super::config::ConfigService;
 
 const SQLITE_POOL_SIZE: u32 = 16;
 const INLINE_THRESHOLD: usize = 256 * 1024; // 256 KB

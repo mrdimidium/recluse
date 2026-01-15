@@ -8,9 +8,9 @@ use semver::Version;
 use thiserror::Error;
 use tracing::error;
 
-use crate::service_config;
-use crate::service_storage;
-use crate::service_upstream;
+use crate::config;
+use crate::storage;
+use crate::upstream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Archive {
@@ -51,16 +51,22 @@ impl<'a> Tarball<'a> {
         let archive;
         let tarball_type;
 
-        // (?:|-bootstrap|-[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(\d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?)\.(?:tar\.xz|zip)(?:\.minisig)?
+        // (?:|-bootstrap|-[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(
+        // \d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?
+        // )\.(?:tar\.xz|zip)(?:\.minisig)?
         buffer = buffer.strip_prefix("zig-").ok_or(ParseError)?;
 
-        // (?:|bootstrap|[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(\d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?)\.(?:tar\.xz|zip)
+        // (?:|bootstrap|[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(
+        // \d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?
+        // )\.(?:tar\.xz|zip)
         if let Some(it) = buffer.strip_suffix(".minisig") {
             buffer = it;
             minisig = true;
         }
 
-        // (?:|bootstrap|[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(\d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?)
+        // (?:|bootstrap|[a-zA-Z0-9_]+-[a-zA-Z0-9_]+)-(
+        // \d+\.\d+\.\d+(?:-dev\.\d+\+[0-9a-f]+)?
+        // )
         if let Some(it) = buffer.strip_suffix(".zip") {
             buffer = it;
             archive = Archive::Zip;
@@ -142,16 +148,16 @@ impl<'a> Tarball<'a> {
 }
 
 pub struct ZigController {
-    config: Arc<service_config::ConfigService>,
-    storage: Arc<service_storage::StorageService>,
-    upstream: Arc<service_upstream::UpstreamService>,
+    config: Arc<config::ConfigService>,
+    storage: Arc<storage::StorageService>,
+    upstream: Arc<upstream::UpstreamService>,
 }
 
 impl ZigController {
     pub fn new(
-        config: Arc<service_config::ConfigService>,
-        storage: Arc<service_storage::StorageService>,
-        upstream: Arc<service_upstream::UpstreamService>,
+        config: Arc<config::ConfigService>,
+        storage: Arc<storage::StorageService>,
+        upstream: Arc<upstream::UpstreamService>,
     ) -> Self {
         Self {
             config,
@@ -189,13 +195,13 @@ impl ZigController {
 
         let entry = controller
             .upstream
-            .fetch(service_upstream::DownloadRequest { url })
+            .fetch(upstream::DownloadRequest { url })
             .await?;
 
         match controller.storage.put("zig", &filename, &entry.bytes).await {
             Ok(()) => {}
             Err(_) => {
-                return Err(http::StatusCode::OK);
+                return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
 
