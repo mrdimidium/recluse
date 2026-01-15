@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{Router, http};
-use tower_http::{request_id, trace::TraceLayer};
+use tower_http::{
+    request_id,
+    trace::{DefaultOnFailure, TraceLayer},
+};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -103,7 +106,8 @@ async fn main() {
             tracing::info_span!("http_request", request_id = %request_id)
         })
         .on_request(log_request)
-        .on_response(log_response);
+        .on_response(log_response)
+        .on_failure(DefaultOnFailure::new().level(tracing::Level::ERROR));
 
     let app = Router::new()
         .merge(web_controller.router())

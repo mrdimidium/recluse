@@ -28,63 +28,70 @@ use std::path::{Path, PathBuf};
 use std::sync;
 
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
-use sqlx::{FromRow, Pool, Sqlite, query, query_as, sqlite};
+use crc32fast::Hasher as Crc32Hasher;
+use sqlx::encode::{Encode, IsNull};
+use sqlx::error::BoxDynError;
+use sqlx::{FromRow, Pool, Sqlite, query, query_as, query_scalar, sqlite};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument, warn};
+use uuid::Uuid;
 
 use super::service_config::ConfigService;
 
 const SQLITE_POOL_SIZE: u32 = 16;
 const INLINE_THRESHOLD: usize = 256 * 1024; // 256 KB
 
-struct FyleSystem {
-    root: PathBuf,
+// You cannot change this ID, this will desynchronize the records in the database and the files on the disk.
+const UUID_ROOT_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x8b, 0x06, 0x3c, 0x4c, 0x6b, 0x5c, 0x4a, 0x8b, 0x92, 0x8f, 0x75, 0x8b, 0x0e, 0x63, 0xc3, 0x5d,
+]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Id(pub Uuid);
+impl std::ops::Deref for Id {
+    type Target = Uuid;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
-
-impl FyleSystem {
-    fn new(root: &Path) -> Self {
-        Self {
-            root: root.to_path_buf(),
-        }
+impl sqlx::Type<Sqlite> for Id {
+    fn type_info() -> sqlite::SqliteTypeInfo {
+        <Vec<u8> as sqlx::Type<Sqlite>>::type_info()
     }
 
-    fn database(&self) -> PathBuf {
-        self.root.join("index.sqlite")
+    fn compatible(ty: &sqlite::SqliteTypeInfo) -> bool {
+        <Vec<u8> as sqlx::Type<Sqlite>>::compatible(ty)
     }
-
-    fn blob_root(&self) -> PathBuf {
-        self.root.join("blob")
+}
+impl<'r> sqlx::decode::Decode<'r, Sqlite> for Id {
+    fn decode(
+        value: sqlite::SqliteValueRef<'r>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let value: Vec<u8> = <Vec<u8> as sqlx::decode::Decode<Sqlite>>::decode(value)?;
+        let uuid = Uuid::from_slice(&value)?;
+        Ok(Id(uuid))
     }
-
-    fn object(&self, scope: &str, file: &str) -> PathBuf {
-        let mut hasher = Sha256::new();
-        hasher.update(scope.as_bytes());
-        hasher.update(b"/");
-        hasher.update(file.as_bytes());
-        hasher.update(b"\0");
-
-        let hash = hasher.finalize();
-        let hash_hex = hex::encode(hash);
-        self.blob_root()
-            .join(&hash_hex[0..2])
-            .join(&hash_hex[2..4])
-            .join(&hash_hex)
+}
+impl<'q> Encode<'q, Sqlite> for Id {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <Sqlite as sqlx::database::Database>::ArgumentBuffer<'q>,
+    ) -> Result<IsNull, BoxDynError> {
+        let value = self.0.as_bytes().to_vec();
+        <Vec<u8> as Encode<Sqlite>>::encode(value, buf)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Blob(pub Bytes);
-
 impl std::ops::Deref for Blob {
     type Target = Bytes;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
-
 impl sqlx::Type<Sqlite> for Blob {
     fn type_info() -> sqlite::SqliteTypeInfo {
         <Vec<u8> as sqlx::Type<Sqlite>>::type_info() // BLOB
@@ -94,7 +101,6 @@ impl sqlx::Type<Sqlite> for Blob {
         <Vec<u8> as sqlx::Type<Sqlite>>::compatible(ty)
     }
 }
-
 impl<'r> sqlx::decode::Decode<'r, Sqlite> for Blob {
     fn decode(
         value: sqlite::SqliteValueRef<'r>,
@@ -102,19 +108,6 @@ impl<'r> sqlx::decode::Decode<'r, Sqlite> for Blob {
         let slice: &'r [u8] = <&'r [u8] as sqlx::decode::Decode<Sqlite>>::decode(value)?;
         Ok(Blob(Bytes::copy_from_slice(slice)))
     }
-}
-
-#[allow(unused)]
-#[derive(Debug, Clone, FromRow)]
-pub struct File {
-    pub id: u64,
-    pub scope: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-
-    pub file_name: String,
-    pub file_size: i64,
-    pub file_bytes: Blob,
-    pub inlined: bool,
 }
 
 #[derive(Debug, Error)]
@@ -135,14 +128,108 @@ pub enum StorageError {
     IoError(#[from] std::io::Error),
 }
 
+#[allow(unused)]
+#[derive(Debug, Clone, FromRow)]
+pub struct File {
+    pub id: Id,
+    pub scope: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+
+    pub file_name: String,
+    pub file_size: i64,
+    pub file_bytes: Blob,
+    pub inlined: bool,
+}
+
+impl File {
+    fn uuid(scope: &str, file: &str) -> Id {
+        let scope_ns = Uuid::new_v5(&UUID_ROOT_NAMESPACE, scope.as_bytes());
+        Id(Uuid::new_v5(&scope_ns, file.as_bytes()))
+    }
+
+    fn hash(scope: &str, file: &str, blob: &[u8]) -> Vec<u8> {
+        let mut hasher = Crc32Hasher::new();
+
+        hasher.update(b"/");
+        hasher.update(scope.as_bytes());
+
+        hasher.update(b"/");
+        hasher.update(file.as_bytes());
+
+        hasher.update(b"/");
+        hasher.update(blob);
+        hasher.update(b"\0");
+
+        hasher.finalize().to_be_bytes().to_vec()
+    }
+}
+
+struct FileSystem {
+    objects: PathBuf,
+    database: PathBuf,
+}
+
+impl FileSystem {
+    fn new(root: &Path) -> Self {
+        Self {
+            objects: root.join("objects"),
+            database: root.join("index.sqlite"),
+        }
+    }
+
+    fn database(&self) -> &Path {
+        &self.database
+    }
+
+    fn objects_root(&self) -> &Path {
+        &self.objects
+    }
+
+    fn object(&self, scope: &str, file: &str) -> PathBuf {
+        let id = File::uuid(scope, file);
+        let hash_hex = hex::encode(id.0.as_bytes());
+        self.objects_root()
+            .join(&hash_hex[0..2])
+            .join(&hash_hex[2..4])
+            .join(&hash_hex)
+    }
+
+    async fn objects_walk<F, Fut>(&self, mut f: F) -> Result<(), StorageError>
+    where
+        F: FnMut(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Result<(), StorageError>>,
+    {
+        if !self.objects.exists() {
+            return Ok(());
+        }
+
+        let mut stack = vec![self.objects.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let mut entries = fs::read_dir(&dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let file_type = entry.file_type().await?;
+
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if file_type.is_file() {
+                    f(path).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 pub struct StorageService {
+    blobfs: FileSystem,
     sqlite: Pool<Sqlite>,
-    blobfs: FyleSystem,
 }
 
 impl StorageService {
     pub async fn new(config: sync::Arc<ConfigService>) -> Result<Self, StorageError> {
-        let blobfs = FyleSystem::new(config.dirname());
+        let blobfs = FileSystem::new(config.dirname());
 
         let connection = format!("sqlite:{}?mode=rwc", blobfs.database().to_str().unwrap());
         let sqlite: Pool<Sqlite> = sqlite::SqlitePoolOptions::new()
@@ -175,29 +262,59 @@ impl StorageService {
     /// Synchronously traverses the tree and removes temporary files.
     /// Must run before the application starts.
     async fn doctor(&self) -> Result<(), StorageError> {
-        let blob_root = self.blobfs.blob_root();
-        if !blob_root.exists() {
-            return Ok(());
-        }
-
-        let mut stack = vec![blob_root.clone()];
-        while let Some(dir) = stack.pop() {
-            let mut entries = fs::read_dir(&dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                let file_type = entry.file_type().await?;
-
-                if file_type.is_dir() {
-                    stack.push(path);
-                } else if file_type.is_file() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.ends_with(".part") {
-                        warn!(path = %path.display(), "cleanup: removing temp file");
-                        let _ = fs::remove_file(&path).await;
-                    }
+        let result = self.blobfs.objects_walk(|path| async move {
+            let name = match path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => name.to_string(),
+                None => {
+                    warn!(path = %path.display(), "cleanup: invalid blob name");
+                    let _ = fs::remove_file(path).await;
+                    return Ok(());
                 }
+            };
+
+            if name.ends_with(".part") {
+                warn!(path = %path.display(), "cleanup: removing temp file");
+                let _ = fs::remove_file(path).await;
+                return Ok(());
             }
-        }
+
+            if name.len() != 32 {
+                warn!(path = %path.display(), "cleanup: invalid blob name length");
+                let _ = fs::remove_file(path).await;
+                return Ok(());
+            }
+
+            let id_bytes = match hex::decode(&name) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    warn!(path = %path.display(), "cleanup: invalid blob name hex");
+                    let _ = fs::remove_file(path).await;
+                    return Ok(());
+                }
+            };
+
+            let id = match Uuid::from_slice(&id_bytes) {
+                Ok(uuid) => Id(uuid),
+                Err(_) => {
+                    warn!(path = %path.display(), "cleanup: invalid blob uuid");
+                    let _ = fs::remove_file(path).await;
+                    return Ok(());
+                }
+            };
+
+            let exists: Option<i64> = query_scalar("SELECT 1 FROM datafiles WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.sqlite)
+                .await?;
+
+            if exists.is_none() {
+                warn!(path = %path.display(), "cleanup: removing orphan blob");
+                let _ = fs::remove_file(path).await;
+            }
+
+            Ok(())
+        });
+        result.await?;
 
         Ok(())
     }
@@ -206,7 +323,7 @@ impl StorageService {
         query(
             "
             CREATE TABLE IF NOT EXISTS datafiles(
-                id         INTEGER PRIMARY KEY,
+                id         BLOB    PRIMARY KEY CHECK (length(id) = 16),
                 scope      TEXT    NOT NULL,
                 created_at TEXT    DEFAULT (datetime('now')),
                 file_name  TEXT    NOT NULL,
@@ -248,7 +365,7 @@ impl StorageService {
                     Err(e) => return Err(e.into()),
                 };
 
-                let hash = self.blob_hash(scope, filename, &bytes);
+                let hash = File::hash(scope, filename, &bytes);
                 if hash != file.file_bytes.to_vec() {
                     return Err(StorageError::IntegrityError);
                 }
@@ -274,7 +391,7 @@ impl StorageService {
         let inlined = bytes.len() <= INLINE_THRESHOLD;
 
         let obj = self.blobfs.object(scope, filename);
-        let tmp = obj.with_extension(format!("{}.part", uuid::Uuid::new_v4()));
+        let tmp = obj.with_extension(format!("{}.part", Uuid::new_v4()));
 
         // write temp file
         if !inlined {
@@ -296,21 +413,23 @@ impl StorageService {
         let payload: Vec<u8> = if inlined {
             bytes.to_vec()
         } else {
-            self.blob_hash(scope, filename, bytes)
+            File::hash(scope, filename, bytes)
         };
 
         let result = async {
             let mut tx = self.sqlite.begin().await?;
+            let id = File::uuid(scope, filename);
 
             let result = query(
                 "
                 INSERT INTO datafiles (
-                    scope, file_name, file_size, file_bytes, inlined
+                    id, scope, file_name, file_size, file_bytes, inlined
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5
+                    ?1, ?2, ?3, ?4, ?5, ?6
                 );
                 ",
             )
+            .bind(id)
             .bind(scope)
             .bind(filename)
             .bind(bytes.len() as i64)
@@ -345,6 +464,7 @@ impl StorageService {
                         Some(file) if file.file_bytes.to_vec() == payload => {
                             if !inlined {
                                 let _ = fs::remove_file(&tmp).await;
+                                tx.rollback().await?;
                             }
 
                             debug!("put: identical file already exists");
@@ -373,21 +493,5 @@ impl StorageService {
         }
 
         result
-    }
-
-    fn blob_hash(&self, scope: &str, file: &str, blob: &[u8]) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-
-        hasher.update(b"/");
-        hasher.update(scope.as_bytes());
-
-        hasher.update(b"/");
-        hasher.update(file.as_bytes());
-
-        hasher.update(b"/");
-        hasher.update(blob);
-        hasher.update(b"\0");
-
-        hasher.finalize().to_vec()
     }
 }

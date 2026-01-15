@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::sync::Arc;
+
 use axum::{Router, body, extract, http, response, routing};
 use semver::Version;
-use std::sync::Arc;
 use thiserror::Error;
+use tracing::error;
 
 use crate::service_config;
 use crate::service_storage;
@@ -179,7 +181,8 @@ impl ZigController {
                 ));
             }
             Ok(None) => {}
-            Err(_) => {
+            Err(err) => {
+                error!("failed get file from storage: {err}");
                 return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
             }
         }

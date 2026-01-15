@@ -3315,6 +3315,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4261,6 +4267,7 @@ checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
@@ -4940,6 +4947,7 @@ dependencies = [
  "bytes",
  "cargo-deny",
  "chrono",
+ "crc32fast",
  "hex",
  "http-body-util",
  "hyper",
@@ -4948,7 +4956,6 @@ dependencies = [
  "minijinja",
  "semver",
  "serde",
- "sha2",
  "sqlx",
  "thiserror 2.0.17",
  "tokio",
