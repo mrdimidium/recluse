@@ -255,7 +255,7 @@ impl WebController {
         response.headers_mut().insert(
             http::header::CONTENT_SECURITY_POLICY,
             http::HeaderValue::from_static(
-                "img-src 'self'; base-uri 'none'; font-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; default-src 'self'; frame-ancestors 'none'",
+                "default-src 'self'; base-uri 'none'; img-src 'self'; font-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'",
             ),
         );
 

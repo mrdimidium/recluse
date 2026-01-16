@@ -495,3 +495,318 @@ impl StorageService {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const BIG_FILE_SIZE: usize = INLINE_THRESHOLD * 64;
+
+    async fn create_storage_at(path: &Path) -> StorageService {
+        let config = sync::Arc::new(ConfigService::for_test(path.to_path_buf()));
+        StorageService::new(config).await.unwrap()
+    }
+
+    async fn create_test_storage() -> (StorageService, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let storage = create_storage_at(tmp.path()).await;
+        (storage, tmp)
+    }
+
+    /// Count files in a directory recursively
+    fn count_files(dir: &Path, ext: Option<&str>) -> usize {
+        let mut count = 0;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    count += count_files(&path, ext);
+                } else if let Some(extension) = ext {
+                    if path.extension().is_some_and(|ext| ext == extension) {
+                        count += 1;
+                    }
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Recursively delete or corrupt all files in a directory
+    fn damage_blobs(dir: &Path, corrupt: bool) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    damage_blobs(&path, corrupt);
+                } else if corrupt {
+                    if let Ok(meta) = path.metadata() {
+                        let _ = std::fs::write(&path, vec![0x00; meta.len() as usize]);
+                    }
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_read_small_file() {
+        let (storage, _tmp) = create_test_storage().await;
+
+        // 1 KB file - should be stored inline
+        let data = Bytes::from(vec![0xAB; 1024]);
+        storage.put("test-scope", "small.bin", &data).await.unwrap();
+
+        let file = storage.get("test-scope", "small.bin").await.unwrap();
+        assert!(file.is_some());
+
+        let file = file.unwrap();
+        assert!(file.inlined);
+        assert_eq!(file.file_bytes.0, data);
+        assert_eq!(file.file_size, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_write_read_large_file() {
+        let (storage, tmp) = create_test_storage().await;
+
+        // Large file - should be stored on disk
+        let data = Bytes::from(vec![0xCD; BIG_FILE_SIZE]);
+        storage.put("test-scope", "large.bin", &data).await.unwrap();
+
+        let file = storage.get("test-scope", "large.bin").await.unwrap();
+        assert!(file.is_some());
+
+        let file = file.unwrap();
+        assert!(!file.inlined);
+        assert_eq!(file.file_bytes.0, data);
+        assert_eq!(file.file_size, (BIG_FILE_SIZE) as i64);
+
+        // Verify file is stored on disk, not inline in SQLite
+        let db_size = std::fs::metadata(tmp.path().join("index.sqlite"))
+            .unwrap()
+            .len();
+        assert!(
+            db_size < data.len() as u64,
+            "database ({db_size} bytes) should be smaller than file ({} bytes)",
+            data.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_read_boundary_file() {
+        let (storage, _tmp) = create_test_storage().await;
+
+        // Exactly 256 KB - should be stored inline (threshold is <=)
+        let data = Bytes::from(vec![0xEF; INLINE_THRESHOLD]);
+        storage
+            .put("test-scope", "boundary.bin", &data)
+            .await
+            .unwrap();
+
+        let file = storage.get("test-scope", "boundary.bin").await.unwrap();
+        assert!(file.is_some());
+
+        let file = file.unwrap();
+        assert!(file.inlined);
+        assert_eq!(file.file_bytes.0, data);
+        assert_eq!(file.file_size, INLINE_THRESHOLD as i64);
+    }
+
+    #[tokio::test]
+    async fn test_read_nonexistent_file() {
+        let (storage, _tmp) = create_test_storage().await;
+
+        let file = storage.get("test-scope", "nonexistent.bin").await.unwrap();
+        assert!(file.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_persistence_after_restart() {
+        let tmp = TempDir::new().unwrap();
+
+        let small_data = Bytes::from(vec![0x11; 1024]);
+        let large_data = Bytes::from(vec![0x22; BIG_FILE_SIZE]);
+
+        // First "session": write files
+        {
+            let storage = create_storage_at(tmp.path()).await;
+            storage
+                .put("persist", "small.bin", &small_data)
+                .await
+                .unwrap();
+            storage
+                .put("persist", "large.bin", &large_data)
+                .await
+                .unwrap();
+            // storage is dropped here, simulating shutdown
+        }
+
+        // Second "session": verify files persist
+        {
+            let storage = create_storage_at(tmp.path()).await;
+
+            let small = storage.get("persist", "small.bin").await.unwrap();
+            assert!(small.is_some());
+            assert_eq!(small.unwrap().file_bytes.0, small_data);
+
+            let large = storage.get("persist", "large.bin").await.unwrap();
+            assert!(large.is_some());
+            assert_eq!(large.unwrap().file_bytes.0, large_data);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_error_blob_not_found() {
+        let (storage, tmp) = create_test_storage().await;
+
+        // Write a large file (stored on disk)
+        let data = Bytes::from(vec![0xAA; BIG_FILE_SIZE]);
+        storage
+            .put("test-scope", "to-delete.bin", &data)
+            .await
+            .unwrap();
+
+        // Delete all blob files from disk
+        damage_blobs(&tmp.path().join("objects"), false);
+
+        // Reading should fail with BlobNotFound
+        let result = storage.get("test-scope", "to-delete.bin").await;
+        assert!(matches!(result, Err(StorageError::BlobNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_error_blob_corrupted() {
+        let (storage, tmp) = create_test_storage().await;
+
+        // Write a large file (stored on disk)
+        let data = Bytes::from(vec![0xBB; BIG_FILE_SIZE]);
+        storage
+            .put("test-scope", "to-corrupt.bin", &data)
+            .await
+            .unwrap();
+
+        // Corrupt all blob files on disk
+        damage_blobs(&tmp.path().join("objects"), true);
+
+        // Reading should fail with IntegrityError
+        let result = storage.get("test-scope", "to-corrupt.bin").await;
+        assert!(matches!(result, Err(StorageError::IntegrityError)));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_put_same_content() {
+        let (storage, tmp) = create_test_storage().await;
+
+        // Write a large file
+        let data = Bytes::from(vec![0xCC; BIG_FILE_SIZE]);
+        storage.put("test-scope", "dup.bin", &data).await.unwrap();
+
+        // Write the same file again with identical content - should succeed
+        let result = storage.put("test-scope", "dup.bin", &data).await;
+        assert!(result.is_ok());
+
+        // Verify no temp files left behind
+        assert_eq!(count_files(&tmp.path().join("objects"), Some("part")), 0);
+
+        // Verify file is still readable with correct content
+        let file = storage.get("test-scope", "dup.bin").await.unwrap();
+        assert!(file.is_some());
+        assert_eq!(file.unwrap().file_bytes.0, data);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_put_different_content() {
+        let (storage, tmp) = create_test_storage().await;
+
+        // Write a large file
+        let data1 = Bytes::from(vec![0xDD; BIG_FILE_SIZE]);
+        storage.put("test-scope", "dup.bin", &data1).await.unwrap();
+
+        // Write the same filename with different content - should fail
+        let data2 = Bytes::from(vec![0xEE; BIG_FILE_SIZE]);
+        let result = storage.put("test-scope", "dup.bin", &data2).await;
+        assert!(matches!(result, Err(StorageError::AlreadyExists(_, _))));
+
+        // Verify no temp files left behind
+        assert_eq!(count_files(&tmp.path().join("objects"), Some("part")), 0);
+
+        // Verify original file is still intact
+        let file = storage.get("test-scope", "dup.bin").await.unwrap();
+        assert!(file.is_some());
+        assert_eq!(file.unwrap().file_bytes.0, data1);
+    }
+
+    #[tokio::test]
+    async fn test_doctor_removes_temp_files() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write a large file
+        let data = Bytes::from(vec![0xAA; BIG_FILE_SIZE]);
+        {
+            let storage = create_storage_at(tmp.path()).await;
+            storage.put("test-scope", "valid.bin", &data).await.unwrap();
+        }
+
+        // Manually create temp files in the objects directory
+        let objects_dir = tmp.path().join("objects");
+        std::fs::create_dir_all(objects_dir.join("ab/cd")).unwrap();
+        std::fs::write(objects_dir.join("ab/cd/test.part"), b"temp1").unwrap();
+        std::fs::write(objects_dir.join("ab/cd/another.12345.part"), b"temp2").unwrap();
+
+        assert_eq!(count_files(&objects_dir, Some("part")), 2);
+
+        // Second session: doctor should clean up temp files
+        {
+            let storage = create_storage_at(tmp.path()).await;
+
+            // Temp files should be gone
+            assert_eq!(count_files(&objects_dir, Some("part")), 0);
+
+            // Valid file should still be readable
+            let file = storage.get("test-scope", "valid.bin").await.unwrap();
+            assert!(file.is_some());
+            assert_eq!(file.unwrap().file_bytes.0, data);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_doctor_removes_orphan_blobs() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write a large file
+        let data = Bytes::from(vec![0xBB; BIG_FILE_SIZE]);
+        {
+            let storage = create_storage_at(tmp.path()).await;
+            storage.put("test-scope", "valid.bin", &data).await.unwrap();
+        }
+
+        // Count files before adding orphan
+        let objects_dir = tmp.path().join("objects");
+        let files_before = count_files(&objects_dir, None);
+        assert_eq!(files_before, 1); // Only the valid blob
+
+        // Manually create an orphan blob (valid hex name but no DB record)
+        std::fs::create_dir_all(objects_dir.join("de/ad")).unwrap();
+        let orphan_name = "deadbeefdeadbeefdeadbeefdeadbeef"; // 32 hex chars
+        std::fs::write(objects_dir.join("de/ad").join(orphan_name), b"orphan").unwrap();
+
+        assert_eq!(count_files(&objects_dir, None), 2);
+
+        // Second session: doctor should clean up orphan blob
+        {
+            let storage = create_storage_at(tmp.path()).await;
+
+            // Only the valid file should remain
+            assert_eq!(count_files(&objects_dir, None), 1);
+
+            // Valid file should still be readable
+            let file = storage.get("test-scope", "valid.bin").await.unwrap();
+            assert!(file.is_some());
+            assert_eq!(file.unwrap().file_bytes.0, data);
+        }
+    }
+}

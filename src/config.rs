@@ -91,3 +91,14 @@ impl ConfigService {
         &self.dirname
     }
 }
+
+#[cfg(test)]
+impl ConfigService {
+    pub fn for_test(dirname: PathBuf) -> Self {
+        Self {
+            listen: "127.0.0.1:0".to_string(),
+            appname: "test".to_string(),
+            dirname,
+        }
+    }
+}
