@@ -5,9 +5,15 @@
 # Specify your name if you want your instance to be identified.
 appname="zorian"
 
-# The address to which the server will respond via HTTP.
-# Use a reverse proxy if you want to add TLS.
-listen="0.0.0.0:3000"
+# Listeners configuration. Each listener has an address and optional hostnames.
+# Empty hostnames means accept all requests (catch-all).
+[[listen]]
+addr = "0.0.0.0:3000"
+hostnames = ["localhost", "127.0.0.1"]
+
+# For HTTPS, set tls_cert and tls_key to PEM file paths.
+# tls_crt = "/etc/zorian/cert.pem"
+# tls_key = "/etc/zorian/key.pem"
 
 # Path to the directory for storing state (indexes, caches, statistics).
 # Must be a writable directory.

@@ -5,6 +5,7 @@
 allow = [
   # Dilution licenses available without restrictions
   "MIT",
+  "ISC",
   "Apache-2.0",
   "BSD-3-Clause",
 

@@ -5,31 +5,26 @@ mod backends;
 mod config;
 mod proxy;
 mod storage;
+mod web;
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::{
-    Router,
     body::Body,
-    extract,
+    extract::{self, connect_info::Connected},
     http::{self, Request, Response},
-    response::{self, IntoResponse},
-    routing,
 };
-use tower_http::{
-    request_id,
-    trace::{DefaultOnFailure, TraceLayer},
-};
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, registry::LookupSpan, util::SubscriberInitExt};
 
 use crate::backends::zig::ZigController;
-
-static REQUEST_ID_HEADER: http::HeaderName = http::HeaderName::from_static("x-request-id");
+use crate::web::WebController;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "\
@@ -40,6 +35,37 @@ Options:
   --help             Show this help message
   --version          Show version
 ";
+
+/// Contains metainfo about one server interface
+#[derive(Clone)]
+struct ListenerInfo {
+    addr: SocketAddr,
+    hosts: Vec<String>,
+}
+
+/// Contains metainfo about one client connection
+#[derive(Clone, Copy, Debug)]
+struct ClientInfo(SocketAddr);
+impl Connected<axum::serve::IncomingStream<'_, TlsListener>> for ClientInfo {
+    fn connect_info(target: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
+        ClientInfo(*target.remote_addr())
+    }
+}
+impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for ClientInfo {
+    fn connect_info(target: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        ClientInfo(*target.remote_addr())
+    }
+}
+
+/// Request info stored in span extensions for logging
+#[derive(Clone)]
+struct RequestInfo {
+    method: http::Method,
+    version: http::Version,
+    path: http::Uri,
+    host: Option<String>,
+    user_agent: Option<String>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -102,58 +128,225 @@ async fn main() {
         upstream.clone(),
     ));
 
-    let trace_layer = TraceLayer::new_for_http()
-        .make_span_with(|req: &http::Request<_>| {
+    const REQUEST_ID_HEADER: http::HeaderName = http::HeaderName::from_static("x-request-id");
+    let trace_layer = tower_http::trace::TraceLayer::new_for_http()
+        .make_span_with(|req: &http::Request<Body>| {
             let request_id = req
                 .headers()
                 .get(&REQUEST_ID_HEADER)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("<invalid>");
+            let local_addr = req.extensions().get::<ListenerInfo>().map(|a| a.addr);
+            let remote_addr = req
+                .extensions()
+                .get::<extract::ConnectInfo<ClientInfo>>()
+                .map(|ci| ci.0.0.ip());
 
-            tracing::info_span!("http_request", request_id = %request_id)
+            tracing::info_span!(
+                "http_request",
+                request_id = %request_id,
+                local_addr = ?local_addr,
+                remote_addr = ?remote_addr,
+            )
         })
-        .on_request(())
-        .on_response(())
-        .on_failure(DefaultOnFailure::new().level(tracing::Level::ERROR));
+        .on_request(|req: &Request<Body>, span: &tracing::Span| {
+            let info = RequestInfo {
+                method: req.method().clone(),
+                path: req.uri().clone(),
+                version: req.version(),
+                host: req
+                    .headers()
+                    .get(http::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from),
+                user_agent: req
+                    .headers()
+                    .get(http::header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from),
+            };
 
-    let app = Router::new()
+            span.with_subscriber(|(id, dispatch)| {
+                if let Some(reg) = dispatch.downcast_ref::<tracing_subscriber::Registry>()
+                    && let Some(span_ref) = reg.span(id)
+                {
+                    span_ref.extensions_mut().insert(info);
+                }
+            });
+        })
+        .on_response(
+            |res: &Response<Body>, latency: std::time::Duration, span: &tracing::Span| {
+                use axum::body::HttpBody as _;
+
+                let status = res.status().as_u16();
+                let content_length = res.body().size_hint().exact();
+                let content_type = res
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok());
+
+                let req_info = span.with_subscriber(|(id, dispatch)| {
+                    dispatch
+                        .downcast_ref::<tracing_subscriber::Registry>()
+                        .and_then(|reg| reg.span(id))
+                        .and_then(|span_ref| span_ref.extensions().get::<RequestInfo>().cloned())
+                });
+
+                if let Some(Some(req_info)) = req_info {
+                    info!(
+                        method = %req_info.method,
+                        version = ?req_info.version,
+                        path = %req_info.path,
+                        host = req_info.host,
+                        user_agent = req_info.user_agent,
+                        status,
+                        latency = latency.as_nanos() as u64,
+                        content_type,
+                        content_length,
+                        "on_response",
+                    );
+                } else {
+                    info!(
+                        status,
+                        latency = latency.as_nanos() as u64,
+                        content_type,
+                        content_length,
+                        "on_response",
+                    );
+                }
+            },
+        )
+        .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR));
+
+    let app = axum::Router::new()
         .merge(web_controller.router())
         .merge(zig_controller.router())
-        .layer(LoggingLayer)
+        .layer(HostValidationLayer)
         .layer(trace_layer)
-        .layer(request_id::PropagateRequestIdLayer::new(
+        .layer(tower_http::request_id::PropagateRequestIdLayer::new(
             REQUEST_ID_HEADER.clone(),
         ))
-        .layer(request_id::SetRequestIdLayer::new(
+        .layer(tower_http::request_id::SetRequestIdLayer::new(
             REQUEST_ID_HEADER.clone(),
-            request_id::MakeRequestUuid,
+            tower_http::request_id::MakeRequestUuid,
         ));
 
-    let listener = tokio::net::TcpListener::bind(config.listen())
-        .await
-        .unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
 
-    info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    for listener_config in config.listeners() {
+        let tcp_listener = tokio::net::TcpListener::bind(&listener_config.addr)
+            .await
+            .unwrap();
+
+        let tls_enabled = listener_config.tls_crt.is_some();
+        info!(
+            "listening {} on {} (hostnames: {})",
+            if tls_enabled { "HTTPS" } else { "HTTP" },
+            tcp_listener.local_addr().unwrap(),
+            if listener_config.hostnames.is_empty() {
+                "*".to_string()
+            } else {
+                listener_config.hostnames.join(", ")
+            },
+        );
+
+        let local_addr = tcp_listener.local_addr().unwrap();
+        let app = app
+            .clone()
+            .layer(axum::Extension(ListenerInfo {
+                addr: local_addr,
+                hosts: listener_config.hostnames.clone(),
+            }))
+            .into_make_service_with_connect_info::<ClientInfo>();
+
+        if let (Some(crt_path), Some(key_path)) =
+            (&listener_config.tls_crt, &listener_config.tls_key)
+        {
+            let tls_listener = TlsListener::new(tcp_listener, crt_path, key_path);
+            tasks.spawn(async move {
+                axum::serve(tls_listener, app).await.unwrap();
+            });
+        } else {
+            tasks.spawn(async move {
+                axum::serve(tcp_listener, app).await.unwrap();
+            });
+        }
+    }
+
+    if let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
 }
 
-#[derive(Clone)]
-pub struct LoggingLayer;
+/// A TLS listener that wraps a TCP listener and performs TLS handshakes.
+struct TlsListener {
+    inner: tokio::net::TcpListener,
+    acceptor: TlsAcceptor,
+}
+impl TlsListener {
+    fn new(inner: tokio::net::TcpListener, crt_path: &Path, key_path: &Path) -> Self {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
-impl<S> tower::Layer<S> for LoggingLayer {
-    type Service = LoggingService<S>;
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(crt_path)
+            .expect("failed to open certificate file")
+            .collect::<Result<_, _>>()
+            .expect("failed to parse certificates");
+
+        let key = PrivateKeyDer::from_pem_file(key_path).expect("failed to read private key");
+
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("failed to build TLS config");
+
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        Self { inner, acceptor }
+    }
+}
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.inner.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!("failed to accept TCP connection: {}", e);
+                    continue;
+                }
+            };
+            match self.acceptor.accept(stream).await {
+                Ok(tls_stream) => return (tls_stream, addr),
+                Err(e) => {
+                    error!("TLS handshake failed from {}: {}", addr, e);
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+/// Layer that validates the Host header against configured hostnames.
+#[derive(Clone)]
+struct HostValidationLayer;
+impl<S> tower::Layer<S> for HostValidationLayer {
+    type Service = HostValidationService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        LoggingService { inner }
+        HostValidationService { inner }
     }
 }
 
 #[derive(Clone)]
-pub struct LoggingService<S> {
+struct HostValidationService<S> {
     inner: S,
 }
-
-impl<S> tower::Service<Request<Body>> for LoggingService<S>
+impl<S> tower::Service<Request<Body>> for HostValidationService<S>
 where
     S: tower::Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send,
@@ -167,206 +360,34 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let interface = req.extensions().get::<ListenerInfo>().cloned();
+
+        // Check if hostname validation is needed
+        if let Some(iface) = interface
+            && !iface.hosts.is_empty()
+        {
+            let host = req
+                .headers()
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|h| h.split(':').next().unwrap_or(h)); // Strip port if present
+
+            let is_valid = host
+                .map(|h| iface.hosts.iter().any(|allowed| allowed == h))
+                .unwrap_or(false);
+
+            if !is_valid {
+                return Box::pin(async move {
+                    Ok(Response::builder()
+                        .status(http::StatusCode::MISDIRECTED_REQUEST)
+                        .body(Body::empty())
+                        .unwrap())
+                });
+            }
+        }
+
         let clone = self.inner.clone();
-
-        // take the service that was ready
-        let inner = std::mem::replace(&mut self.inner, clone);
-        Box::pin(async move { log_request(inner, req).await })
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move { inner.call(req).await })
     }
 }
-
-async fn log_request<S>(mut inner: S, req: Request<Body>) -> Result<Response<Body>, S::Error>
-where
-    S: tower::Service<Request<Body>, Response = Response<Body>>,
-{
-    let start = std::time::Instant::now();
-
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-
-    let headers = req.headers();
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let user_agent = headers
-        .get(http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let referer = headers
-        .get(http::header::REFERER)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
-    let res = inner.call(req).await?;
-
-    let latency = start.elapsed();
-    let status = res.status();
-    let headers = res.headers();
-    let content_length = headers
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok());
-    let content_type = headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok());
-
-    info!(
-        method = %method,
-        uri = %uri,
-        status = %status,
-        latency = ?latency,
-        client_ip = client_ip.as_deref(),
-        user_agent = user_agent.as_deref(),
-        referer = referer.as_deref(),
-        content_length,
-        content_type,
-        "request"
-    );
-
-    Ok(res)
-}
-
-/// Handles html pages rendering and static files
-pub struct WebController {
-    jinja: minijinja::Environment<'static>,
-}
-
-impl Default for WebController {
-    fn default() -> Self {
-        let mut jinja = minijinja::Environment::new();
-        jinja.add_template("index", HTML).unwrap();
-
-        Self { jinja }
-    }
-}
-
-impl WebController {
-    pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
-            .route("/index.css", routing::get(Self::styles))
-            .route("/", routing::get(Self::index))
-            .with_state(self)
-    }
-
-    async fn index(
-        extract::State(controller): extract::State<Arc<Self>>,
-    ) -> Result<response::Response, http::StatusCode> {
-        let template = controller.jinja.get_template("index").unwrap();
-        let rendered = template.render(minijinja::context! {}).unwrap();
-
-        let mut response = response::Html(rendered).into_response();
-        response.headers_mut().insert(
-            http::header::CONTENT_SECURITY_POLICY,
-            http::HeaderValue::from_static(
-                "default-src 'self'; base-uri 'none'; img-src 'self'; font-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'",
-            ),
-        );
-
-        Ok(response)
-    }
-
-    async fn styles() -> Result<axum_extra::response::Css<&'static str>, http::StatusCode> {
-        Ok(axum_extra::response::Css(CSS))
-    }
-}
-
-const HTML: &str = r#"
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <meta http-equiv="X-UA-Compatible" content="ie=edge">
-
-    <title>Earth PKG — tiny & opinionated packages mirror</title>
-    <link rel="stylesheet" href="index.css">
-  </head>
-
-  <body>
-    <h1>Earth PKG — tiny & opinionated packages mirror.</h1>
-
-    <main>
-      <p>This site provides a proxy for downloading zig installation files and dependencies.
-         On the one hand, this reduces the load on the original project's site
-         and makes your infrastructure more reliable by adding redundancy.</p>
-
-      <p>Read more about community mirrors in the <a href="https://ziglang.org/download/community-mirrors/">blog post</a>.
-         Information on how to deploy your own mirror is available 
-         <a href="https://github.com/ziglang/www.ziglang.org/blob/main/MIRRORS.md">in the documentation</a>.</p>
-
-      <h2>Direct usage:</h2>
-
-      <p>For simplicity, you can use tools like <a href="https://github.com/prantlf/zigup">prantlf/zigup</a> and
-         <a href="https://github.com/mlugg/setup-zig">mlugg/setup-zig</a>.</p>
-
-      <p>
-        To install manually:
-        <ol>
-          <li>download zig dist file:<br><code>wget https://pkg.earth/zig/zig-x86_64-linux-0.15.1.tar.xz</code>;</li>
-          <li>download zig minisign file:<br><code>wget https://pkg.earth/zig/zig-x86_64-linux-0.15.1.tar.xz.minisig</code>;</li>
-          <li>check archive integrity:<br><code>minisign -Vm zig-x86_64-linux-0.15.1.tar.xz -P RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U</code>;</li>
-          <li>unpack archive:<br><code>tar -xf "zig-x86_64-linux-0.15.1.tar.xz"</code>;</li>
-          <li>check installed zig:<br><code>./zig-x86_64-linux-0.15.1/zig --version</code>.</li>
-        </ol>
-
-        You can take actual minisign public key in <a href="https://ziglang.org/download/">download page</a>.
-      </p>
-
-      <h2>Privacy policy</h2>
-
-      <p>This mirror is a non-profit project available on a voluntary basis. The author has no plans to fund it.</p>
-
-      <p>Since the mirror is hosted on hardware, we collect access logs to combat bots and brute-force attacks.
-         The logs are used for security purposes and load planning, are not shared with third parties,
-         and are deleted after 30 days.</p>
-
-      <p>Third-party analytics systems are not used, same as client-side trackers.</p>
-    </main>
-  </body>
-</html>
-"#;
-
-const CSS: &str = "
-:root {
-    font-size: 1.125rem;
-    line-height: 1.4;
-    font-family:
-    'Alegreya Sans', -apple-system, BlinkMacSystemFont,
-    'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell,
-    'Open Sans', 'Helvetica Neue', sans-serif;
-}
-
-html {
-    margin: 0;
-    padding: 0;
-}
-
-body {
-    margin: 0 auto;
-    padding: 1.5em 2em;
-    max-width: 680px;
-}
-
-code {
-    font-size: .75rem;
-}
-
-h1, h2, h3, h4, h5, h6 {
-    font-weight: 700;
-    line-height: 1.2;
-    margin: 0;
-}
-
-h1 {
-    font-size: 2.75rem;
-}
-
-h1:first-child {
-    margin-top: 0;
-}
-
-th {
-    text-align: start;
-}
-";

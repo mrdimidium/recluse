@@ -5298,6 +5298,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tower",
  "tower-http",

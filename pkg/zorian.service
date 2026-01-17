@@ -17,6 +17,7 @@ ExecPaths=/usr/local/bin/zorian /usr/lib
 ExecStart=/usr/local/bin/zorian --config=/etc/zorian.toml
 LimitCORE=infinity
 LimitNOFILE=500000
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 # %p is resolved to the systemd unit name
 LogsDirectory=%p
