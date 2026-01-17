@@ -5,6 +5,19 @@
 # Specify your name if you want your instance to be identified.
 appname="zorian"
 
+# Path to the directory for storing state (indexes, caches, statistics).
+# Must be a writable directory.
+dirname="/var/lib/zorian"
+
+# Common server settings
+[server]
+shutdown_timeout = 60          # seconds
+request_timeout = 30           # seconds
+max_body_size = "64 MiB"
+max_concurrent_requests = 512
+rate_limit_period = 10
+rate_limit_burst_size = 50
+
 # Listeners configuration. Each listener has an address and optional hostnames.
 # Empty hostnames means accept all requests (catch-all).
 [[listen]]
@@ -14,7 +27,3 @@ hostnames = ["localhost", "127.0.0.1", "::1"]
 # For HTTPS, set tls_cert and tls_key to PEM file paths.
 # tls_crt = "/etc/zorian/cert.pem"
 # tls_key = "/etc/zorian/key.pem"
-
-# Path to the directory for storing state (indexes, caches, statistics).
-# Must be a writable directory.
-dirname="/var/lib/zorian"

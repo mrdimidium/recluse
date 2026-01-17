@@ -25,10 +25,6 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, registry::LookupSpan, util::SubscriberInitExt};
 
 use crate::backends::zig::ZigController;
-use crate::config::{
-    MAX_BODY_SIZE, MAX_CONCURRENT_REQUESTS, RATE_LIMIT_BURST_SIZE, RATE_LIMIT_PER_SECOND,
-    REQUEST_TIMEOUT, SHUTDOWN_TIMEOUT,
-};
 use crate::web::WebController;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -243,8 +239,8 @@ async fn main() {
         .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR));
 
     let governor_config = tower_governor::governor::GovernorConfigBuilder::default()
-        .per_second(RATE_LIMIT_PER_SECOND)
-        .burst_size(RATE_LIMIT_BURST_SIZE)
+        .period(config.server().rate_limit_period)
+        .burst_size(config.server().rate_limit_burst_size)
         .key_extractor(ClientIpKeyExtractor)
         .finish()
         .unwrap();
@@ -263,14 +259,16 @@ async fn main() {
         ))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             http::StatusCode::REQUEST_TIMEOUT,
-            REQUEST_TIMEOUT,
+            config.server().request_timeout,
         ))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            config.server().max_body_size.as_u64() as usize,
+        ))
         .layer(tower_governor::GovernorLayer::new(Arc::new(
             governor_config,
         )))
         .layer(tower::limit::ConcurrencyLimitLayer::new(
-            MAX_CONCURRENT_REQUESTS,
+            config.server().max_concurrent_requests,
         ));
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -367,7 +365,7 @@ async fn main() {
     drop(shutdown_tx); // broadcast
 
     // Wait for all listeners to finish with timeout
-    let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+    let shutdown_result = tokio::time::timeout(config.server().shutdown_timeout, async {
         while let Some(result) = tasks.join_next().await {
             if let Err(e) = result {
                 error!("listener task failed: {e}");
@@ -379,7 +377,7 @@ async fn main() {
     if shutdown_result.is_err() {
         error!(
             "shutdown timeout after {:?}, aborting {} remaining tasks",
-            SHUTDOWN_TIMEOUT,
+            config.server().shutdown_timeout,
             tasks.len()
         );
         tasks.abort_all();
@@ -488,7 +486,9 @@ where
                     } else {
                         raw
                     };
-                    url::Host::parse(without_port).ok().map(|h| h.to_string())
+                    url::Host::parse(without_port)
+                        .ok()
+                        .map(|h| h.to_string().trim_end_matches('.').to_string())
                 });
 
             let is_valid = host

@@ -51,6 +51,7 @@ sqlx = { version = "0.8", features = [
   "chrono",
   "json",
 ] }
+bytesize = { version = "2.3", features = ["serde"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"] }
 toml = "0.9"
@@ -70,3 +71,4 @@ uuid = { version = "1.19", features = ["v4", "v5"] }
 cargo-deny = "0.19"
 cargo-llvm-cov = "0.6"
 tempfile = "3.24"
+url = "2.5"

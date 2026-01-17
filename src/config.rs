@@ -3,27 +3,19 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use bytesize::ByteSize;
 use serde::Deserialize;
 use thiserror::Error;
 
-/// When receiving a SIGINT/SIGTERM signal, we will wait for the proposed timeout before terminating workers
-pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
-
-/// Request timeout - maximum time to process a request (protects against Slowloris)
-pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Maximum request body size in bytes (64 MB)
-pub const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
-
-/// Maximum number of concurrent requests across all clients
-pub const MAX_CONCURRENT_REQUESTS: usize = 512;
-
-/// Rate limit: requests per second per client IP
-pub const RATE_LIMIT_PER_SECOND: u64 = 10;
-
-/// Rate limit: burst size (max requests allowed in a burst) per client IP
-pub const RATE_LIMIT_BURST_SIZE: u32 = 50;
+fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let secs = u64::deserialize(deserializer)?;
+    Ok(Duration::from_secs(secs))
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -59,6 +51,43 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    /// When receiving a SIGINT/SIGTERM signal, we will wait for the proposed timeout before terminating workers
+    #[serde(deserialize_with = "deserialize_duration_secs")]
+    pub shutdown_timeout: Duration,
+
+    /// Request timeout - maximum time to process a request (protects against Slowloris)
+    #[serde(deserialize_with = "deserialize_duration_secs")]
+    pub request_timeout: Duration,
+
+    /// Maximum request body size
+    pub max_body_size: ByteSize,
+
+    /// Maximum number of concurrent requests across all clients
+    pub max_concurrent_requests: usize,
+
+    /// Rate limit: requests per second per client IP
+    #[serde(deserialize_with = "deserialize_duration_secs")]
+    pub rate_limit_period: Duration,
+
+    /// Rate limit: burst size (max requests allowed in a burst) per client IP
+    pub rate_limit_burst_size: u32,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            shutdown_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(30),
+            max_body_size: ByteSize::mb(64),
+            max_concurrent_requests: 512,
+            rate_limit_period: Duration::from_secs(10),
+            rate_limit_burst_size: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ListenerConfig {
     pub addr: String,
 
@@ -91,17 +120,19 @@ impl Default for ListenerConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ConfigService {
-    listen: Vec<ListenerConfig>,
     appname: String,
     dirname: PathBuf,
+    server: ServerConfig,
+    listen: Vec<ListenerConfig>,
 }
 
 impl Default for ConfigService {
     fn default() -> Self {
         Self {
-            listen: vec![ListenerConfig::default()],
             appname: "zorian".to_string(),
             dirname: PathBuf::from("./.zorian-state"),
+            server: ServerConfig::default(),
+            listen: vec![ListenerConfig::default()],
         }
     }
 }
@@ -170,12 +201,16 @@ impl ConfigService {
         &self.appname
     }
 
-    pub fn listeners(&self) -> &[ListenerConfig] {
-        &self.listen
-    }
-
     pub fn dirname(&self) -> &Path {
         &self.dirname
+    }
+
+    pub fn server(&self) -> &ServerConfig {
+        &self.server
+    }
+
+    pub fn listeners(&self) -> &[ListenerConfig] {
+        &self.listen
     }
 }
 
@@ -183,14 +218,15 @@ impl ConfigService {
 impl ConfigService {
     pub fn for_test(dirname: PathBuf) -> Self {
         Self {
+            appname: "test".to_string(),
+            dirname,
+            server: ServerConfig::default(),
             listen: vec![ListenerConfig {
                 addr: "127.0.0.1:0".to_string(),
                 hostnames: Vec::new(),
                 tls_crt: None,
                 tls_key: None,
             }],
-            appname: "test".to_string(),
-            dirname,
         }
     }
 }
