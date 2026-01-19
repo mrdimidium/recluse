@@ -27,8 +27,9 @@ contents:
     dst: /etc/zorian.toml
     type: config|noreplace
     file_info:
-      mode: 0644
-      owner: zorian
+      mode: 0640
+      owner: root
+      group: zorian
 
   - src: pkg/zorian.service
     dst: /usr/lib/systemd/system/zorian.service
@@ -39,7 +40,7 @@ contents:
     type: dir
     file_info:
       mode: 0755
-      owner: zorian
+      owner: root
       group: zorian
 
 

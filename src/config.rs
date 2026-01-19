@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,6 +16,25 @@ where
 {
     let secs = u64::deserialize(deserializer)?;
     Ok(Duration::from_secs(secs))
+}
+
+fn deserialize_listener_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    let raw = raw.trim();
+
+    // Hostnames are not supported, but localhost shorthands are useful
+    if let Some(port) = raw.strip_prefix("localhost:") {
+        return port
+            .parse::<u16>()
+            .map(|port| SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port))
+            .map_err(|err| serde::de::Error::custom(format!("invalid port in '{raw}': {err}")));
+    }
+
+    raw.parse::<SocketAddr>()
+        .map_err(|err| serde::de::Error::custom(format!("invalid address '{raw}': {err}",)))
 }
 
 #[derive(Debug, Error)]
@@ -38,16 +58,16 @@ pub enum ConfigError {
     NotWritable(PathBuf, std::io::Error),
 
     #[error("listener '{0}': tls_crt is set but tls_key is missing")]
-    TlsKeyMissing(String),
+    TlsKeyMissing(SocketAddr),
 
     #[error("listener '{0}': tls_key is set but tls_crt is missing")]
-    TlsCrtMissing(String),
+    TlsCrtMissing(SocketAddr),
 
     #[error("listener '{0}': TLS crtificate file not found: {1}")]
-    TlsCrtNotFound(String, PathBuf),
+    TlsCrtNotFound(SocketAddr, PathBuf),
 
     #[error("listener '{0}': TLS key file not found: {1}")]
-    TlsKeyNotFound(String, PathBuf),
+    TlsKeyNotFound(SocketAddr, PathBuf),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,7 +109,8 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListenerConfig {
-    pub addr: String,
+    #[serde(deserialize_with = "deserialize_listener_addr")]
+    pub addr: SocketAddr,
 
     /// Hostnames to accept for this listener. Empty means accept all.
     #[serde(default)]
@@ -105,7 +126,7 @@ pub struct ListenerConfig {
 impl Default for ListenerConfig {
     fn default() -> Self {
         Self {
-            addr: "127.0.0.1:3000".to_string(),
+            addr: "127.0.0.1:2025".parse().unwrap(),
             hostnames: vec![
                 String::from("[::1]"),
                 String::from("127.0.0.1"),
@@ -167,27 +188,21 @@ impl ConfigService {
             .map_err(|e| ConfigError::NotWritable(self.dirname.clone(), e))?;
         fs::remove_file(&testfile)?;
 
-        // Validate TLS configuration for each listener
+        // Validate listener configuration
         for listener in &self.listen {
             match (&listener.tls_crt, &listener.tls_key) {
                 (Some(_crt), None) => {
-                    return Err(ConfigError::TlsKeyMissing(listener.addr.clone()));
+                    return Err(ConfigError::TlsKeyMissing(listener.addr));
                 }
                 (None, Some(_)) => {
-                    return Err(ConfigError::TlsCrtMissing(listener.addr.clone()));
+                    return Err(ConfigError::TlsCrtMissing(listener.addr));
                 }
                 (Some(crt), Some(key)) => {
                     if !crt.exists() {
-                        return Err(ConfigError::TlsCrtNotFound(
-                            listener.addr.clone(),
-                            crt.clone(),
-                        ));
+                        return Err(ConfigError::TlsCrtNotFound(listener.addr, crt.clone()));
                     }
                     if !key.exists() {
-                        return Err(ConfigError::TlsKeyNotFound(
-                            listener.addr.clone(),
-                            key.clone(),
-                        ));
+                        return Err(ConfigError::TlsKeyNotFound(listener.addr, key.clone()));
                     }
                 }
                 (None, None) => {}
@@ -222,7 +237,7 @@ impl ConfigService {
             dirname,
             server: ServerConfig::default(),
             listen: vec![ListenerConfig {
-                addr: "127.0.0.1:0".to_string(),
+                addr: "127.0.0.1:0".parse().unwrap(),
                 hostnames: Vec::new(),
                 tls_crt: None,
                 tls_key: None,

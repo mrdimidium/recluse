@@ -10,6 +10,8 @@ repository = "https://github.com/mrdimidium/Zorian"
 
 [dependencies]
 axum = { version = "0.8", features = ["http2", "macros", "multipart"] }
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 axum-extra = { version = "0.12", features = [
   "async-read-body",
   "attachment",
@@ -55,10 +57,6 @@ bytesize = { version = "2.3", features = ["serde"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"] }
 toml = "0.9"
-tokio-rustls = { version = "0.26", default-features = false, features = [
-  "ring",
-  "tls12",
-] }
 tower = { version = "0.5", features = ["full"] }
 tower_governor = { version = "0.8", features = ["axum", "tracing"] }
 tower-http = { version = "0.6", features = ["full"] }

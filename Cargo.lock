@@ -259,6 +259,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-server"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "either",
+ "fs-err",
+ "http",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1044,6 +1066,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf68cef89750956493a66a10f512b9e58d9db21f2a573c079c0bdf1207a54a7"
 dependencies = [
  "autocfg",
+ "tokio",
 ]
 
 [[package]]
@@ -5525,6 +5548,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-extra",
+ "axum-server",
  "bytes",
  "bytesize",
  "cargo-deny",
@@ -5537,13 +5561,13 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "minijinja",
+ "rustls",
  "semver",
  "serde",
  "sqlx",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
- "tokio-rustls",
  "toml",
  "tower",
  "tower-http",

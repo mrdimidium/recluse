@@ -8,19 +8,20 @@ mod storage;
 mod web;
 
 use std::future::Future;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::{
     body::Body,
-    extract::{self, connect_info::Connected},
+    extract::{self, ConnectInfo},
     http::{self, Request, Response},
 };
+use axum_server::Handle;
+use axum_server::tls_rustls::RustlsConfig;
 use tokio::signal;
-use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, registry::LookupSpan, util::SubscriberInitExt};
 
@@ -44,20 +45,6 @@ struct ListenerInfo {
     hosts: Vec<String>,
 }
 
-/// Contains metainfo about one client connection
-#[derive(Clone, Copy, Debug)]
-struct ClientInfo(SocketAddr);
-impl Connected<axum::serve::IncomingStream<'_, TlsListener>> for ClientInfo {
-    fn connect_info(target: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
-        ClientInfo(*target.remote_addr())
-    }
-}
-impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for ClientInfo {
-    fn connect_info(target: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
-        ClientInfo(*target.remote_addr())
-    }
-}
-
 /// Request info stored in span extensions for logging
 #[derive(Clone)]
 struct RequestInfo {
@@ -68,10 +55,9 @@ struct RequestInfo {
     user_agent: Option<String>,
 }
 
-/// Key extractor for tower-governor that uses ClientInfo to get the client IP.
+/// Key extractor for tower-governor that uses ConnectInfo to get the client IP.
 #[derive(Clone)]
 struct ClientIpKeyExtractor;
-
 impl tower_governor::key_extractor::KeyExtractor for ClientIpKeyExtractor {
     type Key = std::net::IpAddr;
 
@@ -81,8 +67,8 @@ impl tower_governor::key_extractor::KeyExtractor for ClientIpKeyExtractor {
 
     fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, tower_governor::GovernorError> {
         req.extensions()
-            .get::<extract::ConnectInfo<ClientInfo>>()
-            .map(|ci| ci.0.0.ip())
+            .get::<extract::ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip())
             .ok_or(tower_governor::GovernorError::UnableToExtractKey)
     }
 }
@@ -159,8 +145,8 @@ async fn main() {
             let local_addr = req.extensions().get::<ListenerInfo>().map(|a| a.addr);
             let remote_addr = req
                 .extensions()
-                .get::<extract::ConnectInfo<ClientInfo>>()
-                .map(|ci| ci.0.0.ip());
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0.ip());
 
             tracing::info_span!(
                 "http_request",
@@ -174,11 +160,7 @@ async fn main() {
                 method: req.method().clone(),
                 path: req.uri().clone(),
                 version: req.version(),
-                host: req
-                    .headers()
-                    .get(http::header::HOST)
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from),
+                host: extract_host(req),
                 user_agent: req
                     .headers()
                     .get(http::header::USER_AGENT)
@@ -272,59 +254,55 @@ async fn main() {
         ));
 
     let mut tasks = tokio::task::JoinSet::new();
-
-    // The channel is used to broadcast SIGINT/SIGTERM to all listeners.
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let handle = Handle::new();
 
     for listener_config in config.listeners() {
-        let tcp_listener = tokio::net::TcpListener::bind(&listener_config.addr)
-            .await
-            .unwrap();
+        let std_listener = TcpListener::bind(listener_config.addr).unwrap();
+        std_listener.set_nonblocking(true).unwrap();
 
-        let tls_enabled = listener_config.tls_crt.is_some();
+        let addr = std_listener.local_addr().unwrap();
+
+        let app = app
+            .clone()
+            .layer(axum::Extension(ListenerInfo {
+                addr,
+                hosts: listener_config.hostnames.clone(),
+            }))
+            .into_make_service_with_connect_info::<SocketAddr>();
+
+        let handle = handle.clone();
+
+        let tls_enabled =
+            if let (Some(crt), Some(key)) = (&listener_config.tls_crt, &listener_config.tls_key) {
+                let rustls_config = RustlsConfig::from_pem_file(crt, key)
+                    .await
+                    .expect("failed to load TLS config");
+
+                tasks.spawn(async move {
+                    let server = axum_server::from_tcp_rustls(std_listener, rustls_config).unwrap();
+                    server.handle(handle).serve(app).await.unwrap();
+                });
+
+                true
+            } else {
+                tasks.spawn(async move {
+                    let server = axum_server::from_tcp(std_listener).unwrap();
+                    server.handle(handle).serve(app).await.unwrap();
+                });
+
+                false
+            };
+
         info!(
             "listening {} on {} (hostnames: {})",
             if tls_enabled { "HTTPS" } else { "HTTP" },
-            tcp_listener.local_addr().unwrap(),
+            addr,
             if listener_config.hostnames.is_empty() {
                 "*".to_string()
             } else {
                 listener_config.hostnames.join(", ")
             },
         );
-
-        let local_addr = tcp_listener.local_addr().unwrap();
-        let app = app
-            .clone()
-            .layer(axum::Extension(ListenerInfo {
-                addr: local_addr,
-                hosts: listener_config.hostnames.clone(),
-            }))
-            .into_make_service_with_connect_info::<ClientInfo>();
-
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        let shutdown_signal = async move {
-            shutdown_rx.recv().await.ok();
-        };
-
-        if let (Some(crt_path), Some(key_path)) =
-            (&listener_config.tls_crt, &listener_config.tls_key)
-        {
-            let tls_listener = TlsListener::new(tcp_listener, crt_path, key_path);
-            tasks.spawn(async move {
-                axum::serve(tls_listener, app)
-                    .with_graceful_shutdown(shutdown_signal)
-                    .await
-                    .unwrap();
-            });
-        } else {
-            tasks.spawn(async move {
-                axum::serve(tcp_listener, app)
-                    .with_graceful_shutdown(shutdown_signal)
-                    .await
-                    .unwrap();
-            });
-        }
     }
 
     // Graceful shutdown
@@ -362,7 +340,7 @@ async fn main() {
         }
     }
 
-    drop(shutdown_tx); // broadcast
+    handle.graceful_shutdown(None);
 
     // Wait for all listeners to finish with timeout
     let shutdown_result = tokio::time::timeout(config.server().shutdown_timeout, async {
@@ -383,59 +361,6 @@ async fn main() {
         tasks.abort_all();
     } else {
         info!("shutdown complete");
-    }
-}
-
-/// A TLS listener that wraps a TCP listener and performs TLS handshakes.
-struct TlsListener {
-    inner: tokio::net::TcpListener,
-    acceptor: TlsAcceptor,
-}
-impl TlsListener {
-    fn new(inner: tokio::net::TcpListener, crt_path: &Path, key_path: &Path) -> Self {
-        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(crt_path)
-            .expect("failed to open certificate file")
-            .collect::<Result<_, _>>()
-            .expect("failed to parse certificates");
-
-        let key = PrivateKeyDer::from_pem_file(key_path).expect("failed to read private key");
-
-        let config = tokio_rustls::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .expect("failed to build TLS config");
-
-        let acceptor = TlsAcceptor::from(Arc::new(config));
-        Self { inner, acceptor }
-    }
-}
-impl axum::serve::Listener for TlsListener {
-    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
-    type Addr = std::net::SocketAddr;
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
-    }
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, addr) = match self.inner.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!("failed to accept TCP connection: {}", e);
-                    continue;
-                }
-            };
-            match self.acceptor.accept(stream).await {
-                Ok(tls_stream) => return (tls_stream, addr),
-                Err(e) => {
-                    error!("TLS handshake failed from {}: {}", addr, e);
-                    continue;
-                }
-            }
-        }
     }
 }
 
@@ -473,25 +398,7 @@ where
         if let Some(iface) = interface
             && !iface.hosts.is_empty()
         {
-            let host = req
-                .headers()
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|raw| {
-                    let without_port = if let Some((host, port)) = raw.rsplit_once(':')
-                        && port.parse::<u16>().is_ok()
-                        && (host.ends_with(']') || !host.contains('['))
-                    {
-                        host
-                    } else {
-                        raw
-                    };
-                    url::Host::parse(without_port)
-                        .ok()
-                        .map(|h| h.to_string().trim_end_matches('.').to_string())
-                });
-
-            let is_valid = host
+            let is_valid = extract_host(&req)
                 .map(|h| {
                     iface
                         .hosts
@@ -514,4 +421,25 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move { inner.call(req).await })
     }
+}
+
+fn extract_host(req: &Request<Body>) -> Option<String> {
+    // HTTP/1.1 uses HOST header, HTTP/2 uses :authority (available via URI)
+    let raw = if let Some(host) = req.headers().get(http::header::HOST) {
+        host.to_str().ok().map(|raw| {
+            if let Some((host, port)) = raw.rsplit_once(':')
+                && port.parse::<u16>().is_ok()
+                && (host.ends_with(']') || !host.contains('['))
+            {
+                host
+            } else {
+                raw
+            }
+        })
+    } else {
+        req.uri().host()
+    };
+
+    raw.and_then(|raw| url::Host::parse(raw).ok())
+        .map(|h| h.to_string().trim_end_matches('.').to_string())
 }

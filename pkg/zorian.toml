@@ -21,7 +21,7 @@ rate_limit_burst_size = 50
 # Listeners configuration. Each listener has an address and optional hostnames.
 # Empty hostnames means accept all requests (catch-all).
 [[listen]]
-addr = "0.0.0.0:3000"
+addr = "0.0.0.0:2025"
 hostnames = ["localhost", "127.0.0.1", "::1"]
 
 # For HTTPS, set tls_cert and tls_key to PEM file paths.
