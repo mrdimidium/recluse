@@ -135,6 +135,7 @@ async fn main() {
     ));
 
     const REQUEST_ID_HEADER: http::HeaderName = http::HeaderName::from_static("x-request-id");
+
     let trace_layer = tower_http::trace::TraceLayer::new_for_http()
         .make_span_with(|req: &http::Request<Body>| {
             let request_id = req
@@ -230,8 +231,27 @@ async fn main() {
     let app = axum::Router::new()
         .merge(web_controller.router())
         .merge(zig_controller.router())
+        // Opt-in layers
+        .layer(tower_http::compression::CompressionLayer::new())
+        // request limits
         .layer(HostValidationLayer)
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            config.server().max_body_size.as_u64() as usize,
+        ))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            http::StatusCode::REQUEST_TIMEOUT,
+            config.server().request_timeout,
+        ))
+        // logging
         .layer(trace_layer)
+        // rate-limits
+        .layer(tower_governor::GovernorLayer::new(Arc::new(
+            governor_config,
+        )))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            config.server().max_concurrent_requests,
+        ))
+        // global headers
         .layer(tower_http::request_id::PropagateRequestIdLayer::new(
             REQUEST_ID_HEADER.clone(),
         ))
@@ -239,18 +259,9 @@ async fn main() {
             REQUEST_ID_HEADER.clone(),
             tower_http::request_id::MakeRequestUuid,
         ))
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            http::StatusCode::REQUEST_TIMEOUT,
-            config.server().request_timeout,
-        ))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            config.server().max_body_size.as_u64() as usize,
-        ))
-        .layer(tower_governor::GovernorLayer::new(Arc::new(
-            governor_config,
-        )))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(
-            config.server().max_concurrent_requests,
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            http::header::SERVER,
+            http::HeaderValue::from_static(concat!("zorian/", env!("CARGO_PKG_VERSION"))),
         ));
 
     let mut tasks = tokio::task::JoinSet::new();

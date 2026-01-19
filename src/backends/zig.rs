@@ -209,6 +209,7 @@ impl ZigController {
     }
 
     fn build_response(status: http::StatusCode, bytes: bytes::Bytes) -> response::Response {
+        // TODO: add etag
         response::Response::builder()
             .status(status)
             .header(http::header::CONTENT_TYPE, "application/octet-stream")

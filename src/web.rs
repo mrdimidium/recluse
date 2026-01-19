@@ -1,13 +1,21 @@
 // SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use axum::{
-    extract::{self},
-    http::{self},
-    response::{self, IntoResponse},
-};
+use axum::body::Body;
+use axum::extract;
+use axum::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use axum::response;
+use chrono::{DateTime, Utc};
+use sqlx::types::chrono;
+use tower::{Layer, Service};
+use tracing::error;
+
+const CSP: &str = "default-src 'self'; base-uri 'none'; img-src 'self'; font-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'";
 
 /// Handles html pages rendering and static files
 pub struct WebController {
@@ -28,29 +36,116 @@ impl WebController {
         axum::Router::new()
             .route("/index.css", axum::routing::get(Self::styles))
             .route("/", axum::routing::get(Self::index))
+            .layer(LastModifiedLayer {})
+            .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache"),
+            ))
+            .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(CSP),
+            ))
             .with_state(self)
     }
 
     async fn index(
         extract::State(controller): extract::State<Arc<Self>>,
-    ) -> Result<response::Response, http::StatusCode> {
-        let template = controller.jinja.get_template("index").unwrap();
-        let rendered = template.render(minijinja::context! {}).unwrap();
+    ) -> Result<axum::response::Html<String>, StatusCode> {
+        let tmpl = controller.jinja.get_template("index");
 
-        let mut response = response::Html(rendered).into_response();
-        response.headers_mut().insert(
-            http::header::CONTENT_SECURITY_POLICY,
-            http::HeaderValue::from_static(
-                "default-src 'self'; base-uri 'none'; img-src 'self'; font-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'",
-            ),
-        );
-
-        Ok(response)
+        tmpl.and_then(|template| template.render(minijinja::context! {}))
+            .map(response::Html)
+            .map_err(|err| {
+                error!("html rendering failed: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
     }
 
-    async fn styles() -> Result<axum_extra::response::Css<&'static str>, http::StatusCode> {
-        Ok(axum_extra::response::Css(CSS))
+    async fn styles() -> axum_extra::response::Css<&'static str> {
+        axum_extra::response::Css(CSS)
     }
+}
+
+#[derive(Clone)]
+pub struct LastModifiedLayer {}
+impl<S> Layer<S> for LastModifiedLayer {
+    type Service = LastModifiedService<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        LastModifiedService {
+            inner,
+
+            // Since the static file is packaged in a binary, we cache it across restarts.
+            // In the future, we can use the build time.
+            last_moidified: Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LastModifiedService<S> {
+    inner: S,
+    last_moidified: DateTime<Utc>,
+}
+impl<S> Service<Request<Body>> for LastModifiedService<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = Response<Body>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let method = req.method().clone();
+        let headers = req.headers().clone();
+        let last_modified = self.last_moidified;
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            let raw = last_modified
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string();
+            let lmh = HeaderValue::from_str(raw.as_str()).unwrap();
+
+            if (method == Method::GET || method == Method::HEAD)
+                && headers
+                    .get(header::IF_MODIFIED_SINCE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_http_date)
+                    .is_some_and(|ims| last_modified <= ims)
+            {
+                match Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::LAST_MODIFIED, lmh.clone())
+                    .body(Body::empty())
+                {
+                    Ok(resp) => {
+                        return Ok(resp);
+                    }
+                    Err(err) => {
+                        error!("build response: {err}")
+                    }
+                }
+            }
+
+            let mut resp = inner.call(req).await?;
+            resp.headers_mut().insert(header::LAST_MODIFIED, lmh);
+            Ok(resp)
+        })
+    }
+}
+
+/// Parse HTTP-date (IMF-fixdate per RFC 7231) or RFC 2822
+fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    // IMF-fixdate: "Tue, 14 Jan 2026 12:34:56 GMT"
+    DateTime::parse_from_rfc2822(value.trim())
+        .map(|d| d.with_timezone(&Utc))
+        .ok()
 }
 
 const HTML: &str = r#"
