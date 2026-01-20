@@ -21,8 +21,10 @@ use axum::{
 };
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
+#[cfg(target_os = "linux")]
+use sd_notify::NotifyState;
 use tokio::signal;
-use tracing::{error, info};
+use tracing::{error, info, trace};
 use tracing_subscriber::{layer::SubscriberExt, registry::LookupSpan, util::SubscriberInitExt};
 
 use crate::backends::zig::ZigController;
@@ -316,40 +318,73 @@ async fn main() {
         );
     }
 
-    // Graceful shutdown
-    let sigint = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+    let mut watchdog_ticker = tokio::time::interval(std::time::Duration::from_mins(1));
+
+    #[cfg(target_os = "linux")]
+    if sd_notify::booted().unwrap_or(false) {
+        sd_notify::notify(false, &[NotifyState::Ready]).ok();
+
+        let mut usec = 0u64;
+        (sd_notify::watchdog_enabled(true, &mut usec) && usec > 0).then(|| {
+            let interval = std::time::Duration::from_micros(usec) / 2;
+            info!(
+                interval_ms = interval.as_millis() as u64,
+                "watchdog enabled"
+            );
+            watchdog_ticker = tokio::time::interval(interval);
+        });
     };
-    let sigterm = {
+
+    #[cfg(unix)]
+    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .expect("failed to install signal handler");
+    #[cfg(windows)]
+    let mut sigint = signal::windows::signal(signal::windows::SignalKind::interrupt())
+        .expect("failed to install signal handler");
+
+    #[cfg(unix)]
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("failed to install signal handler");
+
+    loop {
+        let watchdog = watchdog_ticker.tick();
+
         #[cfg(unix)]
-        let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("failed to install signal handler")
-                .recv()
-                .await;
-        };
-
+        let sigterm = sigterm.recv();
         #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
+        let sigterm = std::future::pending::<()>();
 
-        terminate
-    };
-    tokio::select! {
-        _ = sigint => info!("received SIGINT, shutting down"),
-        _ = sigterm => info!("received SIGTERM, shutting down"),
-        result = tasks.join_next() => {
-            match result {
-                Some(Ok(())) => error!("listener exited unexpectedly, shutting down"),
-                Some(Err(e)) => error!("listener failed: {e}, shutting down"),
-                None => {
-                    error!("no listeners running");
-                    return;
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down");
+                break;
+            },
+            _ = sigterm => {
+                info!("received SIGTERM, shutting down");
+                break;
+            },
+            _ = watchdog => {
+                trace!("server is alive");
+
+                #[cfg(target_os = "linux")]
+                sd_notify::notify(false, &[NotifyState::Watchdog]).ok();
+            },
+            result = tasks.join_next() => {
+                match result {
+                    Some(Ok(())) => error!("listener exited unexpectedly, shutting down"),
+                    Some(Err(e)) => error!("listener failed: {e}, shutting down"),
+                    None => {
+                        error!("no listeners running");
+                        return;
+                    }
                 }
-            }
+                break;
+            },
         }
     }
+
+    #[cfg(target_os = "linux")]
+    sd_notify::notify(false, &[NotifyState::Stopping]).ok();
 
     handle.graceful_shutdown(None);
 

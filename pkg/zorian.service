@@ -8,11 +8,13 @@ After=time-sync.target network-online.target remote-fs.target nss-lookup.target
 Wants=time-sync.target
 
 [Service]
-Type=exec
+Type=notify
 User=zorian
 Group=zorian
 Restart=always
 RestartSec=30
+WatchdogSec=30
+NotifyAccess=main
 ExecPaths=/usr/local/bin/zorian /usr/lib
 ExecStart=/usr/local/bin/zorian --config=/etc/zorian.toml
 LimitCORE=infinity
@@ -25,6 +27,7 @@ StateDirectory=%p
 CacheDirectory=%p
 RuntimeDirectory=%p
 
+UMask=0077
 LockPersonality=yes
 NoNewPrivileges=yes
 PrivateDevices=yes
@@ -42,7 +45,6 @@ ProtectSystem=strict
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
-UMask=0077
 
 [Install]
 # service should not start from the rescue shell (rescue.target).
