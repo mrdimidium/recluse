@@ -1,13 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt::Debug;
+use std::time::SystemTime;
+
+use opentelemetry::InstrumentationScope;
 use opentelemetry::KeyValue;
+use opentelemetry::logs::LogRecord as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{
     LogExporter, Protocol, SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig,
 };
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::logs::{BatchLogProcessor, LogProcessor, SdkLogRecord, SdkLoggerProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
@@ -16,6 +22,31 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::{LogLevel, OtelcolConfig, StdoutFormat, TelemetryConfig};
+
+/// LogProcessor wrapper that sets timestamp from observed_timestamp.
+///
+/// opentelemetry-appender-tracing intentionally doesn't set timestamp because
+/// tracing doesn't provide it. This causes some backends to show epoch (1970-01-01).
+/// See: https://github.com/open-telemetry/opentelemetry-rust/issues/1479
+#[derive(Debug)]
+struct TimestampLogProcessor<P>(P);
+impl<P: LogProcessor> LogProcessor for TimestampLogProcessor<P> {
+    fn emit(&self, record: &mut SdkLogRecord, scope: &InstrumentationScope) {
+        if record.timestamp().is_none() {
+            let ts = record.observed_timestamp().unwrap_or_else(SystemTime::now);
+            record.set_timestamp(ts);
+        }
+        self.0.emit(record, scope);
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.0.force_flush()
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.0.shutdown()
+    }
+}
 
 macro_rules! build_exporter {
     ($Exporter:ident, $cfg:expr, $url:expr, $tls:expr, $path:expr) => {
@@ -103,14 +134,12 @@ impl TelemetryService {
                     .build();
 
                 let logs = cfg.logs.then(|| {
+                    let exporter =
+                        build_exporter!(LogExporter, cfg, url.clone(), tls.clone(), "/v1/logs");
                     let provider = SdkLoggerProvider::builder()
                         .with_resource(resource.clone())
-                        .with_batch_exporter(build_exporter!(
-                            LogExporter,
-                            cfg,
-                            url.clone(),
-                            tls.clone(),
-                            "/v1/logs"
+                        .with_log_processor(TimestampLogProcessor(
+                            BatchLogProcessor::builder(exporter).build(),
                         ))
                         .build();
                     let layer =
