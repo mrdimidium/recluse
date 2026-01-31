@@ -28,6 +28,7 @@ use tokio::signal;
 use tracing::{error, info, trace};
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::backends::go::GoController;
 use crate::backends::zig::ZigController;
 use crate::web::WebController;
 
@@ -120,6 +121,11 @@ async fn main() {
 
     let web_controller = Arc::new(WebController::default());
     let zig_controller = Arc::new(ZigController::new(
+        config.clone(),
+        storage.clone(),
+        upstream.clone(),
+    ));
+    let go_controller = Arc::new(GoController::new(
         config.clone(),
         storage.clone(),
         upstream.clone(),
@@ -222,6 +228,7 @@ async fn main() {
     let app = axum::Router::new()
         .merge(web_controller.router())
         .merge(zig_controller.router())
+        .merge(go_controller.router())
         // Opt-in layers
         .layer(tower_http::compression::CompressionLayer::new())
         // request limits

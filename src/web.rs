@@ -148,7 +148,7 @@ fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
-const HTML: &str = r#"
+const HTML: &str = r##"
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -161,18 +161,25 @@ const HTML: &str = r#"
   </head>
 
   <body>
-    <h1>Earth PKG — tiny & opinionated packages mirror.</h1>
+    <h1>Zorian — tiny & opinionated packages mirror.</h1>
 
     <main>
-      <p>This site provides a proxy for downloading zig installation files and dependencies.
-         On the one hand, this reduces the load on the original project's site
-         and makes your infrastructure more reliable by adding redundancy.</p>
+      <p>This site provides a caching proxy for downloading Zig and Go installation files.
+         It reduces load on upstream servers and makes your infrastructure more reliable by adding redundancy.</p>
+
+      <p>Zorian is open source software licensed under <a href="https://www.gnu.org/licenses/agpl-3.0.html">AGPL-3.0</a>.
+         Source code is available on <a href="https://github.com/mrdimidium/zorian">GitHub</a>.</p>
+
+      <h2>Usage</h2>
+
+      <p>Replace official download URLs with <code>https://pkg.earth/{tool}/{filename}</code>.
+         Files are cached automatically after the first download.</p>
+
+      <h3 id="zig"><a href="#zig">Zig</a></h3>
 
       <p>Read more about community mirrors in the <a href="https://ziglang.org/download/community-mirrors/">blog post</a>.
-         Information on how to deploy your own mirror is available 
+         Information on how to deploy your own mirror is available
          <a href="https://github.com/ziglang/www.ziglang.org/blob/main/MIRRORS.md">in the documentation</a>.</p>
-
-      <h2>Direct usage:</h2>
 
       <p>For simplicity, you can use tools like <a href="https://github.com/prantlf/zigup">prantlf/zigup</a> and
          <a href="https://github.com/mlugg/setup-zig">mlugg/setup-zig</a>.</p>
@@ -181,13 +188,26 @@ const HTML: &str = r#"
         To install manually:
         <ol>
           <li>download zig dist file:<br><code>wget https://pkg.earth/zig/zig-x86_64-linux-0.15.1.tar.xz</code>;</li>
-          <li>download zig minisign file:<br><code>wget https://pkg.earth/zig/zig-x86_64-linux-0.15.1.tar.xz.minisig</code>;</li>
+          <li>download zig minisig file:<br><code>wget https://pkg.earth/zig/zig-x86_64-linux-0.15.1.tar.xz.minisig</code>;</li>
           <li>check archive integrity:<br><code>minisign -Vm zig-x86_64-linux-0.15.1.tar.xz -P RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U</code>;</li>
           <li>unpack archive:<br><code>tar -xf "zig-x86_64-linux-0.15.1.tar.xz"</code>;</li>
           <li>check installed zig:<br><code>./zig-x86_64-linux-0.15.1/zig --version</code>.</li>
         </ol>
+        You can take actual minisig public key at <a href="https://ziglang.org/download/">ziglang.org/download</a>.
+      </p>
 
-        You can take actual minisign public key in <a href="https://ziglang.org/download/">download page</a>.
+      <h3 id="go"><a href="#go">Go</a></h3>
+
+      <p>
+        To install manually:
+        <ol>
+          <li>download go dist file:<br><code>wget https://pkg.earth/go/go1.23.0.linux-amd64.tar.gz</code>;</li>
+          <li>download go sha256 file:<br><code>wget https://pkg.earth/go/go1.23.0.linux-amd64.tar.gz.sha256</code>;</li>
+          <li>check archive integrity:<br><code>sha256sum -c go1.23.0.linux-amd64.tar.gz.sha256</code>;</li>
+          <li>unpack archive:<br><code>tar -xzf go1.23.0.linux-amd64.tar.gz</code>;</li>
+          <li>check installed go:<br><code>./go/bin/go version</code>.</li>
+        </ol>
+        You can find available versions at <a href="https://go.dev/dl/">go.dev/dl</a>.
       </p>
 
       <h2>Privacy policy</h2>
@@ -202,9 +222,9 @@ const HTML: &str = r#"
     </main>
   </body>
 </html>
-"#;
+"##;
 
-const CSS: &str = "
+const CSS: &str = r##"
 :root {
     font-size: 1.125rem;
     line-height: 1.4;
@@ -246,4 +266,13 @@ h1:first-child {
 th {
     text-align: start;
 }
-";
+
+h3 a {
+    color: inherit;
+    text-decoration: none;
+}
+
+h3 a:hover {
+    text-decoration: underline;
+}
+"##;
