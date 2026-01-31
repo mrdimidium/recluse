@@ -6,7 +6,9 @@ mod config;
 mod proxy;
 mod storage;
 mod telemetry;
-mod web;
+
+mod controller_backend;
+mod controller_web;
 
 use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
@@ -28,9 +30,9 @@ use tokio::signal;
 use tracing::{error, info, trace};
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::backends::go::GoController;
-use crate::backends::zig::ZigController;
-use crate::web::WebController;
+use crate::backends::{GoBackend, ZigBackend};
+use crate::controller_backend::BackendController;
+use crate::controller_web::WebController;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "\
@@ -120,16 +122,8 @@ async fn main() {
     let upstream = Arc::new(proxy::ProxyService::new());
 
     let web_controller = Arc::new(WebController::default());
-    let zig_controller = Arc::new(ZigController::new(
-        config.clone(),
-        storage.clone(),
-        upstream.clone(),
-    ));
-    let go_controller = Arc::new(GoController::new(
-        config.clone(),
-        storage.clone(),
-        upstream.clone(),
-    ));
+    let source = format!("zorian:{}", config.appname());
+    let backends = config.backends();
 
     const REQUEST_ID_HEADER: http::HeaderName = http::HeaderName::from_static("x-request-id");
 
@@ -225,10 +219,29 @@ async fn main() {
         .finish()
         .unwrap();
 
-    let app = axum::Router::new()
-        .merge(web_controller.router())
-        .merge(zig_controller.router())
-        .merge(go_controller.router())
+    let mut app = axum::Router::new().merge(web_controller.router());
+
+    if backends.zig.enabled {
+        let backend = ZigBackend::new(backends.zig.clone(), source.clone());
+        let ctrl = Arc::new(BackendController::new(
+            backend,
+            storage.clone(),
+            upstream.clone(),
+        ));
+        app = app.nest("/zig", ctrl.router());
+    }
+
+    if backends.go.enabled {
+        let backend = GoBackend::new(backends.go.clone(), source.clone());
+        let ctrl = Arc::new(BackendController::new(
+            backend,
+            storage.clone(),
+            upstream.clone(),
+        ));
+        app = app.nest("/go", ctrl.router());
+    }
+
+    let app = app
         // Opt-in layers
         .layer(tower_http::compression::CompressionLayer::new())
         // request limits

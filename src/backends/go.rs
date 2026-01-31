@@ -1,15 +1,46 @@
 // SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::sync::Arc;
-
-use axum::{Router, body, extract, http, response, routing};
+use serde::Deserialize;
 use thiserror::Error;
-use tracing::error;
 
-use crate::config;
-use crate::proxy;
-use crate::storage;
+use super::Backend;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GoConfig {
+    pub enabled: bool,
+    pub upstream: String,
+}
+
+impl Default for GoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            upstream: String::from("https://dl.google.com/go"),
+        }
+    }
+}
+
+pub struct GoBackend {
+    config: GoConfig,
+    source: String,
+}
+
+impl GoBackend {
+    pub fn new(config: GoConfig, source: String) -> Self {
+        Self { config, source }
+    }
+}
+
+impl Backend for GoBackend {
+    const ID: &'static str = "go";
+
+    fn upstream_url(&self, filename: &str) -> Result<String, ()> {
+        let tarball = Tarball::parse(filename).map_err(|_| ())?;
+        Ok(tarball.upstream_url(&self.config.upstream, &self.source))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Archive {
@@ -140,12 +171,8 @@ impl<'a> Tarball<'a> {
     }
 
     /// Builds the upstream URL for this tarball.
-    pub fn upstream_url(&self, source: &str) -> String {
-        // Use direct URL (go.dev/dl/ redirects to dl.google.com/go/)
-        format!(
-            "https://dl.google.com/go/{}?source={}",
-            self.filename, source
-        )
+    pub fn upstream_url(&self, upstream: &str, source: &str) -> String {
+        format!("{}/{}?source={}", upstream, self.filename, source)
     }
 }
 
@@ -166,77 +193,6 @@ fn parse_minor_with_release(s: &str) -> Result<(u32, ReleaseType), ParseError> {
     }
     let minor = s.parse::<u32>().map_err(|_| ParseError)?;
     Ok((minor, ReleaseType::Stable))
-}
-
-pub struct GoController {
-    config: Arc<config::ConfigService>,
-    storage: Arc<storage::StorageService>,
-    upstream: Arc<proxy::ProxyService>,
-}
-
-impl GoController {
-    pub fn new(
-        config: Arc<config::ConfigService>,
-        storage: Arc<storage::StorageService>,
-        upstream: Arc<proxy::ProxyService>,
-    ) -> Self {
-        Self {
-            config,
-            storage,
-            upstream,
-        }
-    }
-
-    pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
-            .route("/go/{filename}", routing::get(Self::handle))
-            .with_state(self)
-    }
-
-    async fn handle(
-        extract::State(controller): extract::State<Arc<Self>>,
-        extract::Path(filename): extract::Path<String>,
-    ) -> Result<response::Response, http::StatusCode> {
-        let tarball = Tarball::parse(&filename).map_err(|_| http::StatusCode::NOT_FOUND)?;
-        let url = tarball.upstream_url(controller.config.appname());
-
-        match controller.storage.get("go", &filename).await {
-            Ok(Some(entry)) => {
-                return Ok(Self::build_response(
-                    http::StatusCode::OK,
-                    entry.file_bytes.0,
-                ));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                error!("failed get file from storage: {err}");
-                return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
-
-        let entry = controller
-            .upstream
-            .fetch(proxy::DownloadRequest { url })
-            .await?;
-
-        match controller.storage.put("go", &filename, &entry.bytes).await {
-            Ok(()) => {}
-            Err(_) => {
-                return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
-
-        Ok(Self::build_response(http::StatusCode::OK, entry.bytes))
-    }
-
-    fn build_response(status: http::StatusCode, bytes: bytes::Bytes) -> response::Response {
-        response::Response::builder()
-            .status(status)
-            .header(http::header::CONTENT_TYPE, "application/octet-stream")
-            .header(http::header::CONTENT_LENGTH, bytes.len())
-            .body(body::Body::from(bytes))
-            .unwrap()
-    }
 }
 
 #[cfg(test)]
@@ -333,10 +289,10 @@ mod tests {
     #[test]
     fn test_upstream_url() {
         let t = Tarball::parse("go1.25.6.linux-amd64.tar.gz").unwrap();
-        let url = t.upstream_url("zorian");
+        let url = t.upstream_url("https://dl.google.com/go", "zorian:test");
         assert_eq!(
             url,
-            "https://dl.google.com/go/go1.25.6.linux-amd64.tar.gz?source=zorian"
+            "https://dl.google.com/go/go1.25.6.linux-amd64.tar.gz?source=zorian:test"
         );
     }
 

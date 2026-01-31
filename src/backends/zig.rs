@@ -1,16 +1,47 @@
 // SPDX-FileCopyrightText: 2026 Nikolay Govorov <me@govorov.online>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::sync::Arc;
-
-use axum::{Router, body, extract, http, response, routing};
 use semver::Version;
+use serde::Deserialize;
 use thiserror::Error;
-use tracing::error;
 
-use crate::config;
-use crate::proxy;
-use crate::storage;
+use super::Backend;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ZigConfig {
+    pub enabled: bool,
+    pub upstream: String,
+}
+
+impl Default for ZigConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            upstream: String::from("https://ziglang.org"),
+        }
+    }
+}
+
+pub struct ZigBackend {
+    config: ZigConfig,
+    source: String,
+}
+
+impl ZigBackend {
+    pub fn new(config: ZigConfig, source: String) -> Self {
+        Self { config, source }
+    }
+}
+
+impl Backend for ZigBackend {
+    const ID: &'static str = "zig";
+
+    fn upstream_url(&self, filename: &str) -> Result<String, ()> {
+        let tarball = Tarball::parse(filename).map_err(|_| ())?;
+        Ok(tarball.upstream_url(&self.config.upstream, &self.source))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Archive {
@@ -132,89 +163,14 @@ impl<'a> Tarball<'a> {
     }
 
     /// Builds the upstream URL for this tarball.
-    pub fn upstream_url(&self, source: &str) -> String {
+    pub fn upstream_url(&self, upstream: &str, source: &str) -> String {
         if self.development {
-            format!(
-                "https://ziglang.org/builds/{}?source={}",
-                self.filename, source
-            )
+            format!("{}/builds/{}?source={}", upstream, self.filename, source)
         } else {
             format!(
-                "https://ziglang.org/download/{}/{}?source={}",
-                self.version, self.filename, source,
+                "{}/download/{}/{}?source={}",
+                upstream, self.version, self.filename, source,
             )
         }
-    }
-}
-
-pub struct ZigController {
-    config: Arc<config::ConfigService>,
-    storage: Arc<storage::StorageService>,
-    upstream: Arc<proxy::ProxyService>,
-}
-
-impl ZigController {
-    pub fn new(
-        config: Arc<config::ConfigService>,
-        storage: Arc<storage::StorageService>,
-        upstream: Arc<proxy::ProxyService>,
-    ) -> Self {
-        Self {
-            config,
-            storage,
-            upstream,
-        }
-    }
-
-    pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
-            .route("/zig/{filename}", routing::get(Self::handle))
-            .with_state(self)
-    }
-
-    async fn handle(
-        extract::State(controller): extract::State<Arc<Self>>,
-        extract::Path(filename): extract::Path<String>,
-    ) -> Result<response::Response, http::StatusCode> {
-        let tarball = Tarball::parse(&filename).map_err(|_| http::StatusCode::NOT_FOUND)?;
-        let url = tarball.upstream_url(controller.config.appname());
-
-        match controller.storage.get("zig", &filename).await {
-            Ok(Some(entry)) => {
-                return Ok(Self::build_response(
-                    http::StatusCode::OK,
-                    entry.file_bytes.0,
-                ));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                error!("failed get file from storage: {err}");
-                return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
-
-        let entry = controller
-            .upstream
-            .fetch(proxy::DownloadRequest { url })
-            .await?;
-
-        match controller.storage.put("zig", &filename, &entry.bytes).await {
-            Ok(()) => {}
-            Err(_) => {
-                return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
-
-        Ok(Self::build_response(http::StatusCode::OK, entry.bytes))
-    }
-
-    fn build_response(status: http::StatusCode, bytes: bytes::Bytes) -> response::Response {
-        // TODO: add etag
-        response::Response::builder()
-            .status(status)
-            .header(http::header::CONTENT_TYPE, "application/octet-stream")
-            .header(http::header::CONTENT_LENGTH, bytes.len())
-            .body(body::Body::from(bytes))
-            .unwrap()
     }
 }

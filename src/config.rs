@@ -11,6 +11,8 @@ use bytesize::ByteSize;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::backends::{GoConfig, ZigConfig};
+
 fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -241,6 +243,13 @@ pub struct TelemetryConfig {
     pub otelcol: Option<OtelcolConfig>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct BackendsConfig {
+    pub go: GoConfig,
+    pub zig: ZigConfig,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ConfigService {
@@ -249,6 +258,7 @@ pub struct ConfigService {
     listen: Vec<ListenerConfig>,
     server: ServerConfig,
     telemetry: TelemetryConfig,
+    backends: BackendsConfig,
 }
 impl Default for ConfigService {
     fn default() -> Self {
@@ -258,6 +268,7 @@ impl Default for ConfigService {
             server: ServerConfig::default(),
             listen: vec![ListenerConfig::default()],
             telemetry: TelemetryConfig::default(),
+            backends: BackendsConfig::default(),
         }
     }
 }
@@ -334,6 +345,10 @@ impl ConfigService {
     pub fn telemetry(&self) -> &TelemetryConfig {
         &self.telemetry
     }
+
+    pub fn backends(&self) -> &BackendsConfig {
+        &self.backends
+    }
 }
 
 #[cfg(test)]
@@ -350,6 +365,7 @@ impl ConfigService {
                 tls_key: None,
             }],
             telemetry: TelemetryConfig::default(),
+            backends: BackendsConfig::default(),
         }
     }
 }
