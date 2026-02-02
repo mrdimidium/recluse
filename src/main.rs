@@ -6,6 +6,7 @@ mod config;
 mod proxy;
 mod storage;
 mod telemetry;
+mod utils;
 
 mod controller_backend;
 mod controller_web;
@@ -30,9 +31,81 @@ use tokio::signal;
 use tracing::{error, info, trace};
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::backends::{GoBackend, ZigBackend};
+use crate::backends::{Backend, BackendDelegate, GoBackend, IndexError, ZigBackend};
 use crate::controller_backend::BackendController;
 use crate::controller_web::WebController;
+
+/// Implementation of BackendDelegate for the application.
+struct AppDelegate {
+    proxy: Arc<proxy::ProxyService>,
+    storage: Arc<storage::StorageService>,
+}
+
+#[async_trait::async_trait]
+impl BackendDelegate for AppDelegate {
+    async fn http_get(&self, url: &url::Url) -> Result<bytes::Bytes, IndexError> {
+        self.proxy
+            .fetch(proxy::DownloadRequest { url: url.clone() })
+            .await
+            .map(|f| f.bytes)
+            .map_err(|e| IndexError::Fetch(e.to_string()))
+    }
+
+    fn db(&self) -> &sqlx::Pool<sqlx::Sqlite> {
+        self.storage.db()
+    }
+}
+
+async fn init_backend<B: Backend>(
+    backend: B,
+    index_tasks: &mut tokio::task::JoinSet<()>,
+    index_cancel: tokio_util::sync::CancellationToken,
+) -> Option<Arc<B>> {
+    if !backend.enabled() {
+        return None;
+    }
+    let backend = Arc::new(backend);
+    if let Err(e) = backend.migrate().await {
+        error!(backend = B::ID, "migration failed: {e}");
+        std::process::exit(1);
+    }
+    let interval = backend.refresh_interval();
+    if !interval.is_zero() {
+        index_tasks.spawn(run_index_refresh(
+            B::ID,
+            backend.clone(),
+            interval,
+            index_cancel,
+        ));
+    }
+    Some(backend)
+}
+
+async fn run_index_refresh<B: backends::Backend>(
+    name: &'static str,
+    backend: Arc<B>,
+    interval: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!(backend = name, "index refresh stopped");
+                break;
+            }
+            _ = ticker.tick() => {
+                info!(backend = name, "refreshing index");
+                match backend.fetch_index().await {
+                    Ok(()) => info!(backend = name, "index refreshed"),
+                    Err(e) => error!(backend = name, "index refresh failed: {e}"),
+                }
+            }
+        }
+    }
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "\
@@ -121,9 +194,13 @@ async fn main() {
     let storage = Arc::new(storage::StorageService::new(config.clone()).await.unwrap());
     let upstream = Arc::new(proxy::ProxyService::new());
 
-    let web_controller = Arc::new(WebController::default());
     let source = format!("zorian:{}", config.appname());
     let backends = config.backends();
+
+    let delegate: Arc<dyn BackendDelegate> = Arc::new(AppDelegate {
+        proxy: upstream.clone(),
+        storage: storage.clone(),
+    });
 
     const REQUEST_ID_HEADER: http::HeaderName = http::HeaderName::from_static("x-request-id");
 
@@ -219,22 +296,38 @@ async fn main() {
         .finish()
         .unwrap();
 
+    let mut index_tasks = tokio::task::JoinSet::new();
+    let index_cancel = tokio_util::sync::CancellationToken::new();
+
+    let zig_backend = init_backend(
+        ZigBackend::new(backends.zig.clone(), source.clone(), delegate.clone()),
+        &mut index_tasks,
+        index_cancel.clone(),
+    )
+    .await;
+
+    let go_backend = init_backend(
+        GoBackend::new(backends.go.clone(), source.clone(), delegate.clone()),
+        &mut index_tasks,
+        index_cancel.clone(),
+    )
+    .await;
+
+    let web_controller = Arc::new(WebController::new(zig_backend.clone(), go_backend.clone()));
     let mut app = axum::Router::new().merge(web_controller.router());
 
-    if backends.zig.enabled {
-        let backend = ZigBackend::new(backends.zig.clone(), source.clone());
+    if let Some(ref backend) = zig_backend {
         let ctrl = Arc::new(BackendController::new(
-            backend,
+            backend.clone(),
             storage.clone(),
             upstream.clone(),
         ));
         app = app.nest("/zig", ctrl.router());
     }
 
-    if backends.go.enabled {
-        let backend = GoBackend::new(backends.go.clone(), source.clone());
+    if let Some(ref backend) = go_backend {
         let ctrl = Arc::new(BackendController::new(
-            backend,
+            backend.clone(),
             storage.clone(),
             upstream.clone(),
         ));
@@ -327,7 +420,7 @@ async fn main() {
         );
     }
 
-    let mut watchdog_ticker = tokio::time::interval(std::time::Duration::from_mins(1));
+    let mut watchdog_ticker = tokio::time::interval(std::time::Duration::from_secs(60));
 
     #[cfg(target_os = "linux")]
     if sd_notify::booted().unwrap_or(false) {
@@ -395,13 +488,19 @@ async fn main() {
     #[cfg(target_os = "linux")]
     sd_notify::notify(false, &[NotifyState::Stopping]).ok();
 
+    index_cancel.cancel();
     handle.graceful_shutdown(None);
 
-    // Wait for all listeners to finish with timeout
+    // Wait for all tasks to finish with timeout
     let shutdown_result = tokio::time::timeout(config.server().shutdown_timeout, async {
         while let Some(result) = tasks.join_next().await {
             if let Err(e) = result {
                 error!("listener task failed: {e}");
+            }
+        }
+        while let Some(result) = index_tasks.join_next().await {
+            if let Err(e) = result {
+                error!("index task failed: {e}");
             }
         }
     })
@@ -409,11 +508,11 @@ async fn main() {
 
     if shutdown_result.is_err() {
         error!(
-            "shutdown timeout after {:?}, aborting {} remaining tasks",
+            "shutdown timeout after {:?}, aborting remaining tasks",
             config.server().shutdown_timeout,
-            tasks.len()
         );
         tasks.abort_all();
+        index_tasks.abort_all();
     } else {
         info!("shutdown complete");
     }

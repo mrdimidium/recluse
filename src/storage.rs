@@ -259,6 +259,11 @@ impl StorageService {
         Ok(storage)
     }
 
+    /// Get SQLite pool for use by backends
+    pub fn db(&self) -> &Pool<Sqlite> {
+        &self.sqlite
+    }
+
     /// Synchronously traverses the tree and removes temporary files.
     /// Must run before the application starts.
     async fn doctor(&self) -> Result<(), StorageError> {

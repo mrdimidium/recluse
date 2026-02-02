@@ -12,33 +12,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::backends::{GoConfig, ZigConfig};
-
-fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let secs = u64::deserialize(deserializer)?;
-    Ok(Duration::from_secs(secs))
-}
-
-fn deserialize_listener_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    let raw = raw.trim();
-
-    // Hostnames are not supported, but localhost shorthands are useful
-    if let Some(port) = raw.strip_prefix("localhost:") {
-        return port
-            .parse::<u16>()
-            .map(|port| SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port))
-            .map_err(|err| serde::de::Error::custom(format!("invalid port in '{raw}': {err}")));
-    }
-
-    raw.parse::<SocketAddr>()
-        .map_err(|err| serde::de::Error::custom(format!("invalid address '{raw}': {err}",)))
-}
+use crate::utils::{deserialize_duration_secs, deserialize_listener_addr};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -96,7 +70,6 @@ pub struct ServerConfig {
     /// Rate limit: burst size (max requests allowed in a burst) per client IP
     pub rate_limit_burst_size: u32,
 }
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -124,7 +97,6 @@ pub struct ListenerConfig {
     /// Path to TLS private key file (PEM format). If set, tls_crt must also be set.
     pub tls_key: Option<PathBuf>,
 }
-
 impl Default for ListenerConfig {
     fn default() -> Self {
         Self {
@@ -217,7 +189,6 @@ pub struct OtelcolConfig {
     /// HTTP headers for authentication
     pub headers: HashMap<String, String>,
 }
-
 impl Default for OtelcolConfig {
     fn default() -> Self {
         Self {

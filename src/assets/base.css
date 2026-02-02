@@ -35,7 +35,7 @@ html {
 
 body {
   margin: 0 auto;
-  max-width: 680px;
+  max-width: 960px;
   padding: 1.5em 2em;
 }
 
@@ -45,10 +45,10 @@ pre, code {
 }
 
 h1, h2, h3, h4, h5, h6 {
+  margin: 1rem 0;
   font-weight: 700;
   line-height: 1.2;
   text-wrap: balance;
-  margin: 0;
 }
 
 h1 {
@@ -59,12 +59,20 @@ h1:first-child {
   margin-top: 0;
 }
 
-p {
+p, details {
+  margin: 1em 0;
   text-wrap: pretty;
 }
 
-th {
+table {
+  border-collapse: collapse;
+}
+
+th, td {
+  padding: 7px 8px;
+  border: 2px solid black;
   text-align: start;
+  vertical-align: top;
 }
 
 h3 a {

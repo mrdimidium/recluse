@@ -10,11 +10,13 @@ use axum::body::Body;
 use axum::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use axum::{extract, routing};
 use chrono::{DateTime, Utc};
-use maud::html;
+use maud::{Markup, html};
 use rust_embed::Embed;
 use sqlx::types::chrono;
 use tower::{Layer, Service};
 use tracing::error;
+
+use crate::backends::{Backend, GoBackend, ZigBackend};
 
 #[derive(Embed)]
 #[folder = "src/assets/"]
@@ -23,8 +25,16 @@ struct Assets;
 const CSP: &str = "default-src 'self'; base-uri 'none'; img-src 'self'; font-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'";
 
 /// Handles html pages rendering and static files
-#[derive(Default)]
-pub struct WebController {}
+pub struct WebController {
+    zig: Option<Arc<ZigBackend>>,
+    go: Option<Arc<GoBackend>>,
+}
+
+impl WebController {
+    pub fn new(zig: Option<Arc<ZigBackend>>, go: Option<Arc<GoBackend>>) -> Self {
+        Self { zig, go }
+    }
+}
 
 impl WebController {
     pub fn router(self: Arc<Self>) -> axum::Router {
@@ -33,7 +43,8 @@ impl WebController {
             .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("no-cache"),
-            ));
+            ))
+            .with_state(self.clone());
 
         let assets = axum::Router::new().route("/assets/{*path}", routing::get(Self::assets));
 
@@ -45,7 +56,6 @@ impl WebController {
                 header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(CSP),
             ))
-            .with_state(self)
     }
 
     async fn assets(extract::Path(path): extract::Path<String>) -> Response<Body> {
@@ -75,7 +85,31 @@ impl WebController {
         }
     }
 
-    async fn index() -> maud::Markup {
+    async fn index(extract::State(ctrl): extract::State<Arc<Self>>) -> Markup {
+        let zig_versions = if let Some(ref backend) = ctrl.zig {
+            match backend.get_versions().await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("failed to get zig versions: {e}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let go_versions = if let Some(ref backend) = ctrl.go {
+            match backend.get_versions().await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("failed to get go versions: {e}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         html! {
             (maud::DOCTYPE)
 
@@ -113,6 +147,60 @@ impl WebController {
                         a href="#zig" { "Zig" }
                     }
 
+                    @if !zig_versions.is_empty() {
+                        details {
+                            summary { "Available versions (" (zig_versions.len()) ")" }
+
+                            p { "You can take actual minisig public key at " a href="https://ziglang.org/download/" { "ziglang.org/download" } "." }
+                            table {
+                                thead {
+                                    tr {
+                                        th { "Version" }
+                                        th { "Date" }
+                                        th { "Docs" }
+                                        th { "Targets" }
+                                    }
+                                }
+                                tbody {
+                                    @for v in zig_versions.iter().rev() {
+                                        tr {
+                                            td { (v.version) }
+                                            td { (v.date.as_deref().unwrap_or("-")) }
+                                            td {
+                                                @if let Some(ref url) = v.docs {
+                                                    a href=(url) { "docs" }
+                                                }
+                                                " "
+                                                @if let Some(ref url) = v.std_docs {
+                                                    a href=(url) { "std" }
+                                                }
+                                                " "
+                                                @if let Some(ref url) = v.notes {
+                                                    a href=(url) { "notes" }
+                                                }
+                                            }
+                                            td {
+                                                @if let Some(ref src) = v.src {
+                                                    a href=(format!("/zig/{}", src.filename)) { code { "src" } }
+                                                    " "
+                                                }
+                                                @if let Some(ref bootstrap) = v.bootstrap {
+                                                    a href=(format!("/zig/{}", bootstrap.filename)) { code { "bootstrap" } }
+                                                    " "
+                                                }
+                                                @for (target, tarball) in v.targets.iter() {
+                                                    a href=(format!("/zig/{}", tarball.filename)) { code { (target) } }
+                                                    " "
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+
                     p {
                         "Read more about community mirrors in the " a href="https://ziglang.org/download/community-mirrors/" { "blog post" } ". "
                         "Information on how to deploy your own mirror is available " a href="https://github.com/ziglang/www.ziglang.org/blob/main/MIRRORS.md" { "in the documentation" } "."
@@ -132,21 +220,49 @@ impl WebController {
                             li { "unpack archive:" br; code { "tar -xf 'zig-x86_64-linux-0.15.1.tar.xz'" } ";" }
                             li { "check installed zig:" br; code { "./zig-x86_64-linux-0.15.1/zig --version" } ";" }
                         }
-                        "You can take actual minisig public key at " a href="https://ziglang.org/download/" { "ziglang.org/download" } "."
                     }
 
                     h3 id="go" { a href="#go" { "Go" } }
 
-                    p {
-                        "To install manually:"
-                        ol {
+                    @if !go_versions.is_empty() {
+                        details {
+                            summary { "Available versions (" (go_versions.len()) ")" }
+
+                            p { "You can find available versions at " a href="https://go.dev/dl/" { "go.dev/dl" } "." }
+                            table {
+                                thead {
+                                    tr {
+                                        th { "Version" }
+                                        th { "Stable" }
+                                        th { "Files" }
+                                    }
+                                }
+                                tbody {
+                                    @for v in go_versions.iter().rev() {
+                                        tr {
+                                            td { (v.version) }
+                                            td { @if v.stable { "✓" } @else { "" } }
+                                            td {
+                                                @for file in &v.files {
+                                                    a href=(format!("/go/{}", file.filename)) { code { (file.filename) } }
+                                                    " "
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    p { "To install manually:" }
+
+                    ol {
                         li { "download go dist file:" br; code { "wget https://pkg.earth/go/go1.23.0.linux-amd64.tar.gz" } ";" }
                         li { "download go sha256 file:" br; code { "wget https://pkg.earth/go/go1.23.0.linux-amd64.tar.gz.sha256" } ";" }
                         li { "check archive integrity:" br; code { "sha256sum -c go1.23.0.linux-amd64.tar.gz.sha256" } ";" }
                         li { "unpack archive:" br; code { "tar -xzf go1.23.0.linux-amd64.tar.gz" } ";" }
                         li { "check installed go:" br; code { "./go/bin/go version" } ";" }
-                        }
-                        "You can find available versions at " a href="https://go.dev/dl/" { "go.dev/dl" } "."
                     }
 
                     h2 { "Privacy policy" }

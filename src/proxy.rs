@@ -7,10 +7,11 @@ use hyper::{Request, http};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
+use url::Url;
 
 #[derive(Clone)]
 pub struct DownloadRequest {
-    pub url: String,
+    pub url: Url,
 }
 
 #[derive(Clone)]
@@ -32,7 +33,7 @@ impl ProxyService {
     pub async fn fetch(&self, request: DownloadRequest) -> Result<File, http::StatusCode> {
         let request = Request::builder()
             .method(http::Method::GET)
-            .uri(&request.url)
+            .uri(request.url.as_str())
             .header(http::header::USER_AGENT, "zorian/0.1")
             .body(Empty::<Bytes>::new())
             .unwrap();
