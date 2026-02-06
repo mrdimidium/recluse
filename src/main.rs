@@ -31,48 +31,23 @@ use tokio::signal;
 use tracing::{error, info, trace};
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::backends::{Backend, BackendDelegate, GoBackend, IndexError, ZigBackend};
+use crate::backends::{Backend, BackendSpec, GoBackend, ZigBackend};
 use crate::controller_backend::BackendController;
 use crate::controller_web::WebController;
 
-/// Implementation of BackendDelegate for the application.
-struct AppDelegate {
-    proxy: Arc<proxy::ProxyService>,
-    storage: Arc<storage::StorageService>,
-}
-
-#[async_trait::async_trait]
-impl BackendDelegate for AppDelegate {
-    async fn http_get(&self, url: &url::Url) -> Result<bytes::Bytes, IndexError> {
-        self.proxy
-            .fetch(proxy::DownloadRequest { url: url.clone() })
-            .await
-            .map(|f| f.bytes)
-            .map_err(|e| IndexError::Fetch(e.to_string()))
-    }
-
-    fn db(&self) -> &sqlx::Pool<sqlx::Sqlite> {
-        self.storage.db()
-    }
-}
-
-async fn init_backend<B: Backend>(
-    backend: B,
+async fn init_backend<S: BackendSpec>(
+    backend: Backend<S>,
     index_tasks: &mut tokio::task::JoinSet<()>,
     index_cancel: tokio_util::sync::CancellationToken,
-) -> Option<Arc<B>> {
+) -> Option<Arc<Backend<S>>> {
     if !backend.enabled() {
         return None;
     }
     let backend = Arc::new(backend);
-    if let Err(e) = backend.migrate().await {
-        error!(backend = B::ID, "migration failed: {e}");
-        std::process::exit(1);
-    }
     let interval = backend.refresh_interval();
     if !interval.is_zero() {
         index_tasks.spawn(run_index_refresh(
-            B::ID,
+            S::ID,
             backend.clone(),
             interval,
             index_cancel,
@@ -81,9 +56,9 @@ async fn init_backend<B: Backend>(
     Some(backend)
 }
 
-async fn run_index_refresh<B: backends::Backend>(
+async fn run_index_refresh<S: BackendSpec>(
     name: &'static str,
-    backend: Arc<B>,
+    backend: Arc<Backend<S>>,
     interval: std::time::Duration,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -98,7 +73,7 @@ async fn run_index_refresh<B: backends::Backend>(
             }
             _ = ticker.tick() => {
                 info!(backend = name, "refreshing index");
-                match backend.fetch_index().await {
+                match backend.refresh().await {
                     Ok(()) => info!(backend = name, "index refreshed"),
                     Err(e) => error!(backend = name, "index refresh failed: {e}"),
                 }
@@ -180,15 +155,10 @@ async fn main() {
         telemetry::TelemetryService::init(config.telemetry(), config.appname(), VERSION);
 
     let storage = Arc::new(storage::StorageService::new(config.clone()).await.unwrap());
-    let upstream = Arc::new(proxy::ProxyService::new());
+    let network = Arc::new(proxy::ProxyService::new());
 
     let source = format!("zorian:{}", config.appname());
     let backends = config.backends();
-
-    let delegate: Arc<dyn BackendDelegate> = Arc::new(AppDelegate {
-        proxy: upstream.clone(),
-        storage: storage.clone(),
-    });
 
     const REQUEST_ID_HEADER: http::HeaderName = http::HeaderName::from_static("x-request-id");
 
@@ -288,14 +258,24 @@ async fn main() {
     let index_cancel = tokio_util::sync::CancellationToken::new();
 
     let zig_backend = init_backend(
-        ZigBackend::new(backends.zig.clone(), source.clone(), delegate.clone()),
+        ZigBackend::new(
+            backends.zig.clone(),
+            source.clone(),
+            storage.clone(),
+            network.clone(),
+        ),
         &mut index_tasks,
         index_cancel.clone(),
     )
     .await;
 
     let go_backend = init_backend(
-        GoBackend::new(backends.go.clone(), source.clone(), delegate.clone()),
+        GoBackend::new(
+            backends.go.clone(),
+            source.clone(),
+            storage.clone(),
+            network.clone(),
+        ),
         &mut index_tasks,
         index_cancel.clone(),
     )
@@ -308,7 +288,7 @@ async fn main() {
         let ctrl = Arc::new(BackendController::new(
             backend.clone(),
             storage.clone(),
-            upstream.clone(),
+            network.clone(),
         ));
         app = app.nest("/zig", ctrl.router());
     }
@@ -317,7 +297,7 @@ async fn main() {
         let ctrl = Arc::new(BackendController::new(
             backend.clone(),
             storage.clone(),
-            upstream.clone(),
+            network.clone(),
         ));
         app = app.nest("/go", ctrl.router());
     }

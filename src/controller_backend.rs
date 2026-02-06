@@ -7,20 +7,20 @@ use axum::{Router, body, extract, http, response, routing};
 use mime_guess::mime;
 use tracing::error;
 
-use crate::backends::{Backend, ResolveError, ResolvedFile};
+use crate::backends::{Backend, BackendError, BackendSpec, ResolvedFile};
 use crate::proxy;
 use crate::storage;
 
 /// Generic controller for backend HTTP handling.
-pub struct BackendController<B: Backend> {
-    backend: Arc<B>,
+pub struct BackendController<S: BackendSpec> {
+    backend: Arc<Backend<S>>,
     storage: Arc<storage::StorageService>,
     upstream: Arc<proxy::ProxyService>,
 }
 
-impl<B: Backend> BackendController<B> {
+impl<S: BackendSpec> BackendController<S> {
     pub fn new(
-        backend: Arc<B>,
+        backend: Arc<Backend<S>>,
         storage: Arc<storage::StorageService>,
         upstream: Arc<proxy::ProxyService>,
     ) -> Self {
@@ -46,17 +46,17 @@ impl<B: Backend> BackendController<B> {
                 return Ok(Self::build_response(http::StatusCode::OK, data, mime));
             }
             Ok(ResolvedFile::Upstream { url, mime }) => (url, mime),
-            Err(ResolveError::NotFound) => {
-                error!(backend = B::ID, filename, "file not found");
+            Err(BackendError::NotFound) => {
+                error!(backend = S::ID, filename, "file not found");
                 return Err(http::StatusCode::NOT_FOUND);
             }
-            Err(ResolveError::Internal) => {
-                error!(backend = B::ID, filename, "internal error resolving file");
+            Err(e) => {
+                error!(backend = S::ID, filename, "error resolving file: {e}");
                 return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
             }
         };
 
-        match controller.storage.get(B::ID, &filename).await {
+        match controller.storage.get(S::ID, &filename).await {
             Ok(Some(entry)) => {
                 return Ok(Self::build_response(
                     http::StatusCode::OK,
@@ -67,7 +67,7 @@ impl<B: Backend> BackendController<B> {
             Ok(None) => {}
             Err(err) => {
                 error!(
-                    backend = B::ID,
+                    backend = S::ID,
                     filename, "failed to get file from storage: {err}"
                 );
                 return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -79,11 +79,11 @@ impl<B: Backend> BackendController<B> {
             .fetch(proxy::DownloadRequest { url })
             .await?;
 
-        match controller.storage.put(B::ID, &filename, &entry.bytes).await {
+        match controller.storage.put(S::ID, &filename, &entry.bytes).await {
             Ok(()) => {}
             Err(err) => {
                 error!(
-                    backend = B::ID,
+                    backend = S::ID,
                     filename, "failed to put file to storage: {err}"
                 );
                 return Err(http::StatusCode::INTERNAL_SERVER_ERROR);

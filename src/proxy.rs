@@ -7,7 +7,11 @@ use hyper::{Request, http};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
+use tower::ServiceExt;
+use tower_http::follow_redirect::FollowRedirect;
 use url::Url;
+
+use super::backends::{BackendError, BackendNetwork};
 
 #[derive(Clone)]
 pub struct DownloadRequest {
@@ -20,14 +24,16 @@ pub struct File {
 }
 
 pub struct ProxyService {
-    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    client: FollowRedirect<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
 }
 
 impl ProxyService {
     pub fn new() -> Self {
         let https = HttpsConnector::new();
         let client = Client::builder(TokioExecutor::new()).build(https);
-        Self { client }
+        Self {
+            client: FollowRedirect::new(client),
+        }
     }
 
     pub async fn fetch(&self, request: DownloadRequest) -> Result<File, http::StatusCode> {
@@ -40,7 +46,8 @@ impl ProxyService {
 
         let response = self
             .client
-            .request(request)
+            .clone()
+            .oneshot(request)
             .await
             .map_err(|_| http::StatusCode::GATEWAY_TIMEOUT)?;
 
@@ -57,5 +64,15 @@ impl ProxyService {
             .to_bytes();
 
         Ok(File { bytes })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendNetwork for ProxyService {
+    async fn http_get(&self, url: &url::Url) -> Result<bytes::Bytes, BackendError> {
+        self.fetch(DownloadRequest { url: url.clone() })
+            .await
+            .map(|f| f.bytes)
+            .map_err(|e| BackendError::Network(e.to_string()))
     }
 }

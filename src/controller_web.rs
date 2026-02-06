@@ -16,7 +16,7 @@ use sqlx::types::chrono;
 use tower::{Layer, Service};
 use tracing::error;
 
-use crate::backends::{Backend, GoBackend, ZigBackend};
+use crate::backends::{GoBackend, ZigBackend};
 
 #[derive(Embed)]
 #[folder = "src/assets/"]
@@ -46,16 +46,16 @@ impl WebController {
             ))
             .with_state(self.clone());
 
-        let assets = axum::Router::new().route("/assets/{*path}", routing::get(Self::assets));
+        let assets = axum::Router::new()
+            .route("/assets/{*path}", routing::get(Self::assets))
+            .layer(LastModifiedLayer {});
 
-        axum::Router::new()
-            .merge(pages)
-            .merge(assets)
-            .layer(LastModifiedLayer {})
-            .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+        axum::Router::new().merge(pages).merge(assets).layer(
+            tower_http::set_header::SetResponseHeaderLayer::overriding(
                 header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(CSP),
-            ))
+            ),
+        )
     }
 
     async fn assets(extract::Path(path): extract::Path<String>) -> Response<Body> {
@@ -87,7 +87,7 @@ impl WebController {
 
     async fn index(extract::State(ctrl): extract::State<Arc<Self>>) -> Markup {
         let zig_versions = if let Some(ref backend) = ctrl.zig {
-            match backend.get_versions().await {
+            match backend.get_releases().await {
                 Ok(v) => v,
                 Err(e) => {
                     error!("failed to get zig versions: {e}");
@@ -99,7 +99,7 @@ impl WebController {
         };
 
         let go_versions = if let Some(ref backend) = ctrl.go {
-            match backend.get_versions().await {
+            match backend.get_releases().await {
                 Ok(v) => v,
                 Err(e) => {
                     error!("failed to get go versions: {e}");
@@ -165,31 +165,23 @@ impl WebController {
                                     @for v in zig_versions.iter().rev() {
                                         tr {
                                             td { (v.version) }
-                                            td { (v.date.as_deref().unwrap_or("-")) }
+                                            td { (v.meta.date.as_deref().unwrap_or("-")) }
                                             td {
-                                                @if let Some(ref url) = v.docs {
+                                                @if let Some(ref url) = v.meta.docs {
                                                     a href=(url) { "docs" }
                                                 }
                                                 " "
-                                                @if let Some(ref url) = v.std_docs {
+                                                @if let Some(ref url) = v.meta.std_docs {
                                                     a href=(url) { "std" }
                                                 }
                                                 " "
-                                                @if let Some(ref url) = v.notes {
+                                                @if let Some(ref url) = v.meta.notes {
                                                     a href=(url) { "notes" }
                                                 }
                                             }
                                             td {
-                                                @if let Some(ref src) = v.src {
-                                                    a href=(format!("/zig/{}", src.filename)) { "src" }
-                                                    " "
-                                                }
-                                                @if let Some(ref bootstrap) = v.bootstrap {
-                                                    a href=(format!("/zig/{}", bootstrap.filename)) { "bootstrap" }
-                                                    " "
-                                                }
-                                                @for (target, tarball) in v.targets.iter() {
-                                                    a href=(format!("/zig/{}", tarball.filename)) { (target) }
+                                                @for file in &v.files {
+                                                    a href=(format!("/zig/{}", file.filename)) { (&file.meta.target) }
                                                     " "
                                                 }
                                             }
@@ -240,7 +232,7 @@ impl WebController {
                                     @for v in go_versions.iter().rev() {
                                         tr {
                                             td { (v.version) }
-                                            td { @if v.stable { "✓" } @else { "" } }
+                                            td { @if v.meta.stable { "✓" } @else { "" } }
                                             td {
                                                 @for file in &v.files {
                                                     a href=(format!("/go/{}", file.filename)) { (file.filename) }

@@ -35,27 +35,25 @@ use sqlx::{FromRow, Pool, Sqlite, query, query_as, query_scalar, sqlite};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
+use super::backends::{BackendError, BackendStorage, RawRelease, RawReleaseFile, Release};
 use super::config::ConfigService;
 
 const SQLITE_POOL_SIZE: u32 = 16;
 const INLINE_THRESHOLD: usize = 256 * 1024; // 256 KB
 
-// You cannot change this ID, this will desynchronize the records in the database and the files on the disk.
-const UUID_ROOT_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x8b, 0x06, 0x3c, 0x4c, 0x6b, 0x5c, 0x4a, 0x8b, 0x92, 0x8f, 0x75, 0x8b, 0x0e, 0x63, 0xc3, 0x5d,
-]);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id(pub Uuid);
+
 impl std::ops::Deref for Id {
     type Target = Uuid;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
+
 impl sqlx::Type<Sqlite> for Id {
     fn type_info() -> sqlite::SqliteTypeInfo {
         <Vec<u8> as sqlx::Type<Sqlite>>::type_info()
@@ -65,6 +63,7 @@ impl sqlx::Type<Sqlite> for Id {
         <Vec<u8> as sqlx::Type<Sqlite>>::compatible(ty)
     }
 }
+
 impl<'r> sqlx::decode::Decode<'r, Sqlite> for Id {
     fn decode(
         value: sqlite::SqliteValueRef<'r>,
@@ -74,6 +73,7 @@ impl<'r> sqlx::decode::Decode<'r, Sqlite> for Id {
         Ok(Id(uuid))
     }
 }
+
 impl<'q> Encode<'q, Sqlite> for Id {
     fn encode_by_ref(
         &self,
@@ -86,12 +86,14 @@ impl<'q> Encode<'q, Sqlite> for Id {
 
 #[derive(Debug, Clone)]
 pub struct Blob(pub Bytes);
+
 impl std::ops::Deref for Blob {
     type Target = Bytes;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
+
 impl sqlx::Type<Sqlite> for Blob {
     fn type_info() -> sqlite::SqliteTypeInfo {
         <Vec<u8> as sqlx::Type<Sqlite>>::type_info() // BLOB
@@ -101,6 +103,7 @@ impl sqlx::Type<Sqlite> for Blob {
         <Vec<u8> as sqlx::Type<Sqlite>>::compatible(ty)
     }
 }
+
 impl<'r> sqlx::decode::Decode<'r, Sqlite> for Blob {
     fn decode(
         value: sqlite::SqliteValueRef<'r>,
@@ -128,9 +131,10 @@ pub enum StorageError {
     IoError(#[from] std::io::Error),
 }
 
+/// Cached file entry (datafiles table)
 #[allow(unused)]
 #[derive(Debug, Clone, FromRow)]
-pub struct File {
+pub struct Object {
     pub id: Id,
     pub scope: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -141,9 +145,15 @@ pub struct File {
     pub inlined: bool,
 }
 
-impl File {
+impl Object {
+    // You cannot change this ID, this will desynchronize the records in the database and the files on the disk.
+    const UUID_ROOT_NAMESPACE: Uuid = Uuid::from_bytes([
+        0x8b, 0x06, 0x3c, 0x4c, 0x6b, 0x5c, 0x4a, 0x8b, 0x92, 0x8f, 0x75, 0x8b, 0x0e, 0x63, 0xc3,
+        0x5d,
+    ]);
+
     fn uuid(scope: &str, file: &str) -> Id {
-        let scope_ns = Uuid::new_v5(&UUID_ROOT_NAMESPACE, scope.as_bytes());
+        let scope_ns = Uuid::new_v5(&Object::UUID_ROOT_NAMESPACE, scope.as_bytes());
         Id(Uuid::new_v5(&scope_ns, file.as_bytes()))
     }
 
@@ -161,6 +171,64 @@ impl File {
         hasher.update(b"\0");
 
         hasher.finalize().to_be_bytes().to_vec()
+    }
+}
+
+/// Builder for file query SQL
+pub struct FileQuery<'a> {
+    backend: &'a str,
+    version: Option<&'a str>,
+    filename: Option<&'a str>,
+    meta_null: Option<&'a str>,
+}
+
+impl<'a> FileQuery<'a> {
+    pub fn new(backend: &'a str) -> Self {
+        Self {
+            backend,
+            version: None,
+            filename: None,
+            meta_null: None,
+        }
+    }
+
+    pub fn version(mut self, version: &'a str) -> Self {
+        self.version = Some(version);
+        self
+    }
+
+    pub fn filename(mut self, filename: &'a str) -> Self {
+        self.filename = Some(filename);
+        self
+    }
+
+    pub fn where_meta_null(mut self, field: &'a str) -> Self {
+        self.meta_null = Some(field);
+        self
+    }
+
+    pub fn build_sql(&self) -> String {
+        let mut sql = String::from(
+            "SELECT backend, version, filename, checksum, size, os, arch, meta FROM files WHERE backend = ?1",
+        );
+        let mut param_idx = 1;
+
+        if self.version.is_some() {
+            param_idx += 1;
+            sql.push_str(&format!(" AND version = ?{}", param_idx));
+        }
+        if self.filename.is_some() {
+            param_idx += 1;
+            sql.push_str(&format!(" AND filename = ?{}", param_idx));
+        }
+        if let Some(field) = self.meta_null {
+            sql.push_str(&format!(
+                " AND (meta IS NULL OR json_extract(meta, '$.{}') IS NULL)",
+                field
+            ));
+        }
+
+        sql
     }
 }
 
@@ -186,7 +254,7 @@ impl FileSystem {
     }
 
     fn object(&self, scope: &str, file: &str) -> PathBuf {
-        let id = File::uuid(scope, file);
+        let id = Object::uuid(scope, file);
         let hash_hex = hex::encode(id.0.as_bytes());
         self.objects_root()
             .join(&hash_hex[0..2])
@@ -259,11 +327,6 @@ impl StorageService {
         Ok(storage)
     }
 
-    /// Get SQLite pool for use by backends
-    pub fn db(&self) -> &Pool<Sqlite> {
-        &self.sqlite
-    }
-
     /// Synchronously traverses the tree and removes temporary files.
     /// Must run before the application starts.
     async fn doctor(&self) -> Result<(), StorageError> {
@@ -325,9 +388,9 @@ impl StorageService {
     }
 
     async fn migrations(&self) -> Result<(), StorageError> {
+        // Object storage table
         query(
-            "
-            CREATE TABLE IF NOT EXISTS datafiles(
+            "CREATE TABLE IF NOT EXISTS datafiles(
                 id         BLOB    PRIMARY KEY CHECK (length(id) = 16),
                 scope      TEXT    NOT NULL,
                 created_at TEXT    DEFAULT (datetime('now')),
@@ -335,20 +398,68 @@ impl StorageService {
                 file_size  INTEGER NOT NULL,
                 file_bytes BLOB,
                 inlined    INTEGER NOT NULL,
-
                 UNIQUE (scope, file_name)
-            ) STRICT;
-            ",
+            ) STRICT",
         )
         .execute(&self.sqlite)
         .await?;
+
+        // Drop old backend-specific tables (data will be re-fetched from upstream)
+        query("DROP TABLE IF EXISTS go_files")
+            .execute(&self.sqlite)
+            .await?;
+        query("DROP TABLE IF EXISTS go_versions")
+            .execute(&self.sqlite)
+            .await?;
+        query("DROP TABLE IF EXISTS zig_files")
+            .execute(&self.sqlite)
+            .await?;
+        query("DROP TABLE IF EXISTS zig_versions")
+            .execute(&self.sqlite)
+            .await?;
+
+        // Unified versions table
+        query(
+            "CREATE TABLE IF NOT EXISTS versions (
+                backend  TEXT    NOT NULL,
+                version  TEXT    NOT NULL,
+                sort_key INTEGER NOT NULL,
+                meta     BLOB    CHECK (meta IS NULL OR (json_valid(meta) AND json_type(meta) = 'object')),
+                PRIMARY KEY (backend, version)
+            ) STRICT",
+        )
+        .execute(&self.sqlite)
+        .await?;
+
+        // Unified files table
+        query(
+            "CREATE TABLE IF NOT EXISTS files (
+                backend   TEXT    NOT NULL,
+                version   TEXT    NOT NULL,
+                filename  TEXT    NOT NULL,
+                checksum  TEXT    NOT NULL,
+                size      INTEGER NOT NULL,
+                os        TEXT,
+                arch      TEXT,
+                meta      BLOB    CHECK (meta IS NULL OR (json_valid(meta) AND json_type(meta) = 'object')),
+                PRIMARY KEY (backend, version, filename),
+                FOREIGN KEY (backend, version) REFERENCES versions(backend, version)
+            ) STRICT",
+        )
+        .execute(&self.sqlite)
+        .await?;
+
+        // Index for fast filename lookups
+        query("CREATE INDEX IF NOT EXISTS idx_files_backend_filename ON files(backend, filename)")
+            .execute(&self.sqlite)
+            .await?;
 
         Ok(())
     }
 
     #[instrument(skip(self))]
-    pub async fn get(&self, scope: &str, filename: &str) -> Result<Option<File>, StorageError> {
-        let file: Option<File> =
+    pub async fn get(&self, scope: &str, filename: &str) -> Result<Option<Object>, StorageError> {
+        let file: Option<Object> =
             query_as("SELECT * FROM datafiles WHERE scope = ?1 AND file_name = ?2")
                 .bind(scope)
                 .bind(filename)
@@ -370,7 +481,7 @@ impl StorageService {
                     Err(e) => return Err(e.into()),
                 };
 
-                let hash = File::hash(scope, filename, &bytes);
+                let hash = Object::hash(scope, filename, &bytes);
                 if hash != file.file_bytes.to_vec() {
                     return Err(StorageError::IntegrityError);
                 }
@@ -418,12 +529,12 @@ impl StorageService {
         let payload: Vec<u8> = if inlined {
             bytes.to_vec()
         } else {
-            File::hash(scope, filename, bytes)
+            Object::hash(scope, filename, bytes)
         };
 
         let result = async {
             let mut tx = self.sqlite.begin().await?;
-            let id = File::uuid(scope, filename);
+            let id = Object::uuid(scope, filename);
 
             let result = query(
                 "
@@ -458,7 +569,7 @@ impl StorageService {
                     Ok(())
                 }
                 Err(sqlx::Error::Database(ref db_err)) if db_err.is_unique_violation() => {
-                    let existing: Option<File> =
+                    let existing: Option<Object> =
                         query_as("SELECT * FROM datafiles WHERE scope = ?1 AND file_name = ?2")
                             .bind(scope)
                             .bind(filename)
@@ -498,6 +609,273 @@ impl StorageService {
         }
 
         result
+    }
+
+    /// Insert or update releases with their files in a single transaction.
+    pub async fn insert_releases(
+        &self,
+        releases: &[(RawRelease, Vec<RawReleaseFile>)],
+    ) -> Result<(), StorageError> {
+        for (release, files) in releases {
+            let mut tx = match self.sqlite.begin().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    error!(
+                        backend = release.backend,
+                        version = release.version,
+                        "failed to start transaction: {e}"
+                    );
+                    return Err(e.into());
+                }
+            };
+
+            let meta_json = release
+                .meta
+                .as_ref()
+                .map(|m| serde_json::to_vec(m).unwrap());
+
+            let result = async {
+                // Insert/update version
+                query(
+                    "INSERT INTO versions (backend, version, sort_key, meta)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(backend, version) DO UPDATE SET
+                         sort_key = excluded.sort_key,
+                         meta = excluded.meta
+                     WHERE sort_key IS NOT excluded.sort_key OR meta IS NOT excluded.meta",
+                )
+                .bind(&release.backend)
+                .bind(&release.version)
+                .bind(release.sort_key)
+                .bind(meta_json.as_deref())
+                .execute(&mut *tx)
+                .await?;
+
+                // Insert/update files
+                for file in files {
+                    let changed =
+                        Self::insert_file(&mut tx, &release.backend, &release.version, file)
+                            .await?;
+                    if changed {
+                        warn!(
+                            backend = release.backend,
+                            version = release.version,
+                            filename = file.filename,
+                            "index file changed"
+                        );
+                    }
+                }
+
+                Ok::<(), StorageError>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => {
+                    if let Err(e) = tx.commit().await {
+                        error!(
+                            backend = release.backend,
+                            version = release.version,
+                            "failed to commit release: {e}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        backend = release.backend,
+                        version = release.version,
+                        "failed to store release, skipping: {e}"
+                    );
+                    let _ = tx.rollback().await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Insert or update a single file within a transaction.
+    /// Returns `true` if an existing file was modified.
+    async fn insert_file(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        backend: &str,
+        version: &str,
+        file: &RawReleaseFile,
+    ) -> Result<bool, StorageError> {
+        let meta_json = file.meta.as_ref().map(|m| serde_json::to_vec(m).unwrap());
+        let os_str = file.os.as_ref().map(AsRef::as_ref);
+        let arch_str = file.arch.as_ref().map(AsRef::as_ref);
+
+        let existed: Option<(i32,)> =
+            query_as("SELECT 1 FROM files WHERE backend = ?1 AND version = ?2 AND filename = ?3")
+                .bind(backend)
+                .bind(version)
+                .bind(&file.filename)
+                .fetch_optional(&mut **tx)
+                .await?;
+
+        let changed: Option<(i32,)> = query_as(
+            "INSERT INTO files (backend, version, filename, checksum, size, os, arch, meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(backend, version, filename) DO UPDATE SET
+                 checksum = excluded.checksum,
+                 size = excluded.size,
+                 os = excluded.os,
+                 arch = excluded.arch,
+                 meta = excluded.meta
+             WHERE checksum IS NOT excluded.checksum
+                OR size IS NOT excluded.size
+                OR os IS NOT excluded.os
+                OR arch IS NOT excluded.arch
+                OR meta IS NOT excluded.meta
+             RETURNING 1",
+        )
+        .bind(backend)
+        .bind(version)
+        .bind(&file.filename)
+        .bind(&file.checksum)
+        .bind(file.size)
+        .bind(os_str)
+        .bind(arch_str)
+        .bind(meta_json.as_deref())
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        Ok(existed.is_some() && changed.is_some())
+    }
+
+    /// Execute a file query.
+    pub async fn query_files_filtered(
+        &self,
+        q: FileQuery<'_>,
+    ) -> Result<Vec<RawReleaseFile>, StorageError> {
+        let sql = q.build_sql();
+
+        let mut query = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                i64,
+                Option<String>,
+                Option<String>,
+                Option<Vec<u8>>,
+            ),
+        >(&sql)
+        .bind(q.backend);
+
+        if let Some(v) = q.version {
+            query = query.bind(v);
+        }
+        if let Some(f) = q.filename {
+            query = query.bind(f);
+        }
+
+        let rows = query.fetch_all(&self.sqlite).await?;
+
+        rows.into_iter()
+            .map(
+                |(backend, version, filename, checksum, size, os_str, arch_str, meta_bytes)| {
+                    let meta = meta_bytes
+                        .map(|b| serde_json::from_slice(&b))
+                        .transpose()
+                        .map_err(|e| StorageError::DbError(sqlx::Error::Decode(Box::new(e))))?;
+
+                    Ok(RawReleaseFile {
+                        backend,
+                        version,
+                        filename,
+                        checksum,
+                        size,
+                        os: os_str.and_then(|s| s.parse().ok()),
+                        arch: arch_str.and_then(|s| s.parse().ok()),
+                        meta,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Query all versions for a backend, ordered by sort_key.
+    pub async fn query_releases(&self, backend: &str) -> Result<Vec<RawRelease>, StorageError> {
+        let rows = query_as::<_, (String, String, i64, Option<Vec<u8>>)>(
+            "SELECT backend, version, sort_key, meta FROM versions WHERE backend = ?1 ORDER BY sort_key",
+        )
+        .bind(backend)
+        .fetch_all(&self.sqlite)
+        .await?;
+
+        rows.into_iter()
+            .map(|(backend, version, sort_key, meta_bytes)| {
+                let meta = meta_bytes
+                    .map(|b| serde_json::from_slice(&b))
+                    .transpose()
+                    .map_err(|e| StorageError::DbError(sqlx::Error::Decode(Box::new(e))))?;
+
+                Ok(Release {
+                    backend,
+                    version,
+                    sort_key,
+                    meta,
+                })
+            })
+            .collect()
+    }
+
+    /// Update a single file entry.
+    pub async fn update_file(&self, file: &RawReleaseFile) -> Result<bool, StorageError> {
+        let mut tx = self.sqlite.begin().await?;
+        let changed = Self::insert_file(&mut tx, &file.backend, &file.version, file).await?;
+        tx.commit().await?;
+        Ok(changed)
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendStorage for StorageService {
+    async fn insert_releases(
+        &self,
+        releases: &[(RawRelease, Vec<RawReleaseFile>)],
+    ) -> Result<(), BackendError> {
+        StorageService::insert_releases(self, releases)
+            .await
+            .map_err(|e| BackendError::Storage(e.to_string()))
+    }
+
+    async fn query_releases(&self, backend: &str) -> Result<Vec<RawRelease>, BackendError> {
+        StorageService::query_releases(self, backend)
+            .await
+            .map_err(|e| BackendError::Storage(e.to_string()))
+    }
+
+    async fn query_files(
+        &self,
+        backend: &str,
+        version: Option<&str>,
+        filename: Option<&str>,
+        meta_null_field: Option<&str>,
+    ) -> Result<Vec<RawReleaseFile>, BackendError> {
+        let mut q = FileQuery::new(backend);
+        if let Some(v) = version {
+            q = q.version(v);
+        }
+        if let Some(f) = filename {
+            q = q.filename(f);
+        }
+        if let Some(field) = meta_null_field {
+            q = q.where_meta_null(field);
+        }
+        self.query_files_filtered(q)
+            .await
+            .map_err(|e| BackendError::Storage(e.to_string()))
+    }
+
+    async fn update_file(&self, file: &RawReleaseFile) -> Result<bool, BackendError> {
+        StorageService::update_file(self, file)
+            .await
+            .map_err(|e| BackendError::Storage(e.to_string()))
     }
 }
 
