@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 [workspace]
-members = ["crates/repos", "crates/zorian", "xtask"]
+members = ["crates/*", "xtask"]
 resolver = "3"
 
 [workspace.package]
@@ -16,6 +16,7 @@ repository = "https://github.com/mrdimidium/Zorian"
 
 [workspace.dependencies]
 # local dependencies
+base = { path = "crates/base" }
 repos = { path = "crates/repos" }
 
 # external
@@ -32,8 +33,6 @@ hyper = "1.8"
 hyper-tls = "0.6"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 maud = { version = "0.27", features = ["axum"] }
-mime_guess = "2.0"
-rust-embed = "8.11"
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",

@@ -12,6 +12,11 @@ SPDX-License-Identifier = "AGPL-3.0-or-later"
 
 [[annotations]]
 path = [
+  "pkg/*.svg",
+  "crates/zorian/src/assets/*.svg",
+  "crates/zorian/src/assets/*.ico",
+  "crates/zorian/src/assets/*.png",
+  "crates/zorian/src/assets/manifest.webmanifest",
   "crates/zorian/src/assets/jetbrainsmono/OFL.txt",
   "crates/zorian/src/assets/jetbrainsmono/*.woff2",
 ]

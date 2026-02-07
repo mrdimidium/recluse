@@ -4,21 +4,41 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use serde::de::Deserialize;
+use ::serde::de::Deserialize;
 
 /// Deserializes a duration from seconds (u64).
 pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: ::serde::Deserializer<'de>,
 {
     let secs = u64::deserialize(deserializer)?;
     Ok(Duration::from_secs(secs))
 }
 
+/// Deserializes a SocketAddr from a string.
+pub fn deserialize_listener_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+where
+    D: ::serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    let raw = raw.trim();
+
+    // Hostnames are not supported, but localhost shorthands are useful
+    if let Some(port) = raw.strip_prefix("localhost:") {
+        return port
+            .parse::<u16>()
+            .map(|port| SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port))
+            .map_err(|err| ::serde::de::Error::custom(format!("invalid port in '{raw}': {err}")));
+    }
+
+    raw.parse::<SocketAddr>()
+        .map_err(|err| ::serde::de::Error::custom(format!("invalid address '{raw}': {err}")))
+}
+
 #[cfg(test)]
 mod deserialize_duration_tests {
     use super::*;
-    use serde::Deserialize;
+    use ::serde::Deserialize;
 
     #[derive(Debug, Deserialize)]
     struct DurationWrapper {
@@ -39,30 +59,10 @@ mod deserialize_duration_tests {
     }
 }
 
-/// Deserializes a SocketAddr from a string.
-pub fn deserialize_listener_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    let raw = raw.trim();
-
-    // Hostnames are not supported, but localhost shorthands are useful
-    if let Some(port) = raw.strip_prefix("localhost:") {
-        return port
-            .parse::<u16>()
-            .map(|port| SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port))
-            .map_err(|err| serde::de::Error::custom(format!("invalid port in '{raw}': {err}")));
-    }
-
-    raw.parse::<SocketAddr>()
-        .map_err(|err| serde::de::Error::custom(format!("invalid address '{raw}': {err}",)))
-}
-
 #[cfg(test)]
 mod deserialize_listener_addr_tests {
     use super::*;
-    use serde::Deserialize;
+    use ::serde::Deserialize;
 
     #[derive(Debug, Deserialize)]
     struct AddrWrapper {

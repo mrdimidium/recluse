@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use axum::{Router, body, extract, http, response, routing};
-use mime_guess::mime;
 use tracing::error;
 
 use crate::proxy;
@@ -100,11 +99,11 @@ impl<S: BackendSpec> BackendController<S> {
     fn build_response(
         status: http::StatusCode,
         bytes: bytes::Bytes,
-        mime: mime::Mime,
+        mime: repos::ContentType,
     ) -> response::Response {
         response::Response::builder()
             .status(status)
-            .header(http::header::CONTENT_TYPE, mime.as_ref())
+            .header(http::header::CONTENT_TYPE, mime.as_str())
             .header(http::header::CONTENT_LENGTH, bytes.len())
             .body(body::Body::from(bytes))
             .unwrap()

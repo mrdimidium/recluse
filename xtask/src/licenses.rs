@@ -135,7 +135,7 @@ fn get_all_crates(cargo_toml: &Utf8Path) -> Result<Krates, krates::Error> {
         builder.ignore_kind(krates::DepKind::Build, krates::Scope::NonWorkspace);
     }
 
-    builder.include_targets(std::iter::empty::<(&str, Vec<String>)>());
+    builder.include_targets(std::iter::once((env!("TARGET"), vec![])));
 
     let graph = builder.build(mdc, |filtered: cm::Package| {
         tracing::debug!("filtered {} {}", filtered.name, filtered.version);

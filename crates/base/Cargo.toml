@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 [package]
-name = "repos"
+name = "base"
 version = "0.0.0"
-description = "A collection of adapters to external repositories"
+description = "Shared types and utilities"
 
 authors.workspace = true
 edition.workspace = true
@@ -14,17 +14,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-base.workspace = true
-
-async-trait.workspace = true
-bytes.workspace = true
-semver.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-strum.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-url.workspace = true
 
 [dev-dependencies]
-proptest.workspace = true
+serde_json.workspace = true

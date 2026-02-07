@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mime_guess::mime;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use url::Url;
 
+pub use base::ContentType;
 pub use go::{GoBackend, GoConfig};
 pub use zig::{ZigBackend, ZigConfig};
 
@@ -151,10 +151,10 @@ pub enum VersionType {
 /// Result of resolving a file request.
 pub enum ResolvedFile {
     /// Proxy request to upstream URL
-    Upstream { mime: mime::Mime, url: Url },
+    Upstream { mime: ContentType, url: Url },
     /// Return content directly
     Content {
-        mime: mime::Mime,
+        mime: ContentType,
         data: bytes::Bytes,
     },
 }
@@ -460,9 +460,9 @@ impl<S: BackendSpec> Backend<S> {
 
         let is_checksum_or_sig = parsed.is_sha256() || parsed.is_signature();
         let mime = if is_checksum_or_sig {
-            mime::TEXT_PLAIN
+            ContentType::TextPlain
         } else {
-            mime::APPLICATION_OCTET_STREAM
+            ContentType::OctetStream
         };
 
         let url = parsed.upstream_url(&self.config, &self.source)?;
