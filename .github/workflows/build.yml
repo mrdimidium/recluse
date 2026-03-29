@@ -33,9 +33,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
   build:
     name: Build (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -62,6 +59,7 @@ jobs:
           passphrase: ${{ secrets.GPG_PASSPHRASE }}
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
 
+      - run: cargo clippy --all-targets --all-features --release -- -D warnings
       - run: cargo build --release
       - run: cargo test --all-features --release --locked
 
@@ -106,6 +104,11 @@ jobs:
           name: packages-${{ matrix.arch }}
           path: dist/*
 
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: binary-${{ matrix.arch }}
+          path: target/release/recluse
+
   smoke:
     name: Smoke tests
     runs-on: ubuntu-24.04
@@ -114,11 +117,15 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: binary-amd64
+          path: target/release/
 
       - name: Run smoke tests against local instance
-        run: ./tests/smoke/run-local.sh
+        run: |
+          chmod +x target/release/recluse
+          ./tests/smoke/run-local.sh
 
   publish:
     name: Publish nightly build

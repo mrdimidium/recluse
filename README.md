@@ -14,7 +14,7 @@ is **not** intended for production use.
 sudo apt install curl gnupg
 
 curl -fsSL https://github.com/dimidiumlabs/recluse/releases/download/nightly/public.gpg | sudo gpg --dearmor -o /usr/share/keyrings/recluse.gpg
-echo "deb [signed-by=/usr/share/keyrings/recluse.gpg] https://recluse.hel1.your-objectstorage.com/apt/ nightly main" | sudo tee /etc/apt/sources.list.d/recluse.list
+echo "deb [signed-by=/usr/share/keyrings/recluse.gpg] https://dimidiumlabs.fsn1.your-objectstorage.com/apt/ nightly main" | sudo tee /etc/apt/sources.list.d/recluse.list
 sudo apt update && sudo apt install recluse
 
 sudo systemctl enable --now recluse

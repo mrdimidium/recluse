@@ -2,7 +2,8 @@
 # Copyright (c) 2026 Nikolay Govorov
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# Builds recluse, starts it in a temporary directory, runs smoke tests, cleans up.
+# Starts recluse in a temporary directory, runs smoke tests, cleans up.
+# Expects a prebuilt binary at target/release/recluse (run `cargo build --release` first).
 #
 # Usage:
 #   ./tests/smoke/run-local.sh          # default port 2025
@@ -10,16 +11,13 @@
 
 set -euo pipefail
 
+BIN="target/release/recluse"
 PORT="${RECLUSE_PORT:-2025}"
 BASE_URL="http://127.0.0.1:${PORT}"
 
 TMPDIR="$(mktemp -d)"
 LOGFILE="$TMPDIR/recluse.log"
 trap 'kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -rf "$TMPDIR"' EXIT
-
-# Build
-echo "Building recluse..."
-cargo build --release -p recluse
 
 # Write minimal config
 cat > "$TMPDIR/recluse.toml" <<EOF
@@ -49,7 +47,7 @@ mkdir -p "$TMPDIR/state"
 # Start recluse
 echo "Starting recluse on ${BASE_URL}..."
 echo "Server log: ${LOGFILE}"
-cargo run --release -p recluse -- --config="$TMPDIR/recluse.toml" >"$LOGFILE" 2>&1 &
+"$BIN" --config="$TMPDIR/recluse.toml" >"$LOGFILE" 2>&1 &
 PID=$!
 
 # Wait for index to load (log shows "index refreshed" for each backend)
